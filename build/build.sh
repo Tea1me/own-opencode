@@ -152,33 +152,68 @@ build_windows() {
   tar xf "$win_temp_dir/source.tar.gz" --strip 1 -C "$win_temp_dir"
   rm -f "$win_temp_dir/source.tar.gz"
 
-  # OpenCode 上游真实 CLI 入口是 packages/opencode/src/index.ts
   if [ ! -f "$win_temp_dir/$entrypoint" ]; then
     echo "❌ 未找到 OpenCode TypeScript 入口: $entrypoint"
     exit 1
   fi
 
-  # 源码方式运行必须把依赖一起装进 portable 包，否则首次运行会在线自动安装依赖。
-  # Actions 在 Linux 上执行，但 Bun 支持 --os/--cpu 为 Windows 目标安装平台依赖。
   if ! command -v bun >/dev/null 2>&1; then
     echo "❌ 构建 Windows 源码 portable 包需要 CI 中安装 Bun"
-    echo "   请在 workflow 中为 windows matrix 添加 oven-sh/setup-bun@v2"
+    echo "   workflow 中请保留 oven-sh/setup-bun@v2"
     exit 1
   fi
 
-  echo "📦 安装 OpenCode Windows x64 运行依赖"
+  # 关键修复：
+  # {./packages/opencode}... = packages/opencode + 它直接/间接依赖的所有 workspace。
+  # 不能只 filter ./packages/opencode，否则 @opencode-ai/core 等 workspace 不会链接。
+  echo "📦 安装 OpenCode Windows x64 production workspace 依赖链"
   (
     cd "$win_temp_dir"
     bun install \
       --production \
-      --frozen-lockfile \
-      --filter './packages/opencode' \
+      --filter '{./packages/opencode}...' \
       --os=win32 \
       --cpu=x64 \
       --backend=copyfile \
       --linker=hoisted \
       --ignore-scripts
   )
+
+  # 验证最先会用到的内部 workspace 已被 Bun 正确链接。
+  if [ ! -e "$win_temp_dir/node_modules/@opencode-ai/core/package.json" ]; then
+    echo "❌ workspace 安装失败: node_modules/@opencode-ai/core 不存在"
+    echo "📋 @opencode-ai 目录:"
+    find "$win_temp_dir/node_modules/@opencode-ai" -maxdepth 2 -print 2>/dev/null || true
+    exit 1
+  fi
+
+  # Bun 对 workspace:* 通常创建 symlink 指向 packages/*。
+  # 为避免 Windows 解压 tar.gz 时 symlink 丢失/权限失败，只把“指向当前源码树内部”的
+  # node_modules symlink 实体化为真实目录。外部 npm 包已经由 copyfile 安装。
+  echo "📦 实体化内部 workspace 链接（Windows portable）"
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+    case "$target" in
+      "$win_temp_dir"/packages/*)
+        echo "  materialize: ${link#$win_temp_dir/} -> ${target#$win_temp_dir/}"
+        tmp_copy="${link}.portable-copy"
+        rm -rf "$tmp_copy"
+        cp -aL "$link" "$tmp_copy"
+        rm -f "$link"
+        mv "$tmp_copy" "$link"
+        ;;
+    esac
+  done < <(find "$win_temp_dir" -path '*/node_modules/*' -type l -print0)
+
+  if [ -L "$win_temp_dir/node_modules/@opencode-ai/core" ]; then
+    echo "❌ @opencode-ai/core 仍然是 symlink，portable 实体化失败"
+    exit 1
+  fi
+
+  if [ ! -f "$win_temp_dir/node_modules/@opencode-ai/core/src/installation/version.ts" ]; then
+    echo "❌ @opencode-ai/core 实体目录缺少 src/installation/version.ts"
+    exit 1
+  fi
 
   # 2. 下载对应运行时
   if [ "$runtime" = "modern" ]; then
@@ -187,7 +222,7 @@ build_windows() {
     unzip -q "$win_temp_dir/bun.zip" -d "$win_temp_dir/runtime/bun"
     rm -f "$win_temp_dir/bun.zip"
 
-    # 兼容 Bun zip 内多一层 bun-windows-x64/ 的情况，统一到 runtime/bun/bun.exe
+    # 统一 Bun zip 布局到 runtime/bun/bun.exe
     if [ ! -f "$win_temp_dir/runtime/bun/bun.exe" ]; then
       local bun_exe
       bun_exe=$(find "$win_temp_dir/runtime/bun" -type f -name 'bun.exe' -print -quit || true)
@@ -201,12 +236,11 @@ build_windows() {
     echo "🔻 下载 Node.js 运行时"
     download_file "$NODE_DOWNLOAD_URL" "$win_temp_dir/node.zip"
     unzip -q "$win_temp_dir/node.zip" -d "$win_temp_dir/runtime/node"
-    # 简化Node路径
     mv "$win_temp_dir/runtime/node/node-${NODE_VERSION}-win-x64"/* "$win_temp_dir/runtime/node/"
     rm -rf "$win_temp_dir/runtime/node/node-${NODE_VERSION}-win-x64"
     rm -f "$win_temp_dir/node.zip"
 
-    # Node 18 不能原生执行 .ts；内置一个本地 tsx loader，仍然是源码 + Node runtime 路线。
+    # Node 18 不能原生执行 .ts；随包放 tsx loader，仍是源码 + Node runtime。
     mkdir -p "$win_temp_dir/runtime/tsx"
     cat > "$win_temp_dir/runtime/tsx/package.json" << 'TSXEOF'
 {
@@ -234,11 +268,9 @@ TSXEOF
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem Always run relative to this portable directory, even when launched through PATH.
 cd /d "%~dp0"
 set "OPENCODE_ENTRYPOINT=packages\opencode\src\index.ts"
 
-rem Detect Windows version (keep the original runtime-selection logic).
 set "win_version=0"
 for /f "tokens=2 delims=[]" %%i in ('ver') do (
   for /f "tokens=2" %%j in ('echo %%i ^| findstr /C:"Version"') do set "win_version=%%j"
@@ -265,7 +297,7 @@ if "!win_version!" geq "10.0.17763" (
 )
 EOF_BAT
 
-  # cmd.exe 对由 Linux 生成的 LF-only bat 兼容并不稳定，强制写成 CRLF。
+  # Linux Actions 生成 bat 时强制 CRLF。
   sed -i 's/$/\r/' "$win_temp_dir/opencode.bat"
 
   # 4. 打包
@@ -274,6 +306,7 @@ EOF_BAT
 
   echo "✅ Windows 版本构建完成"
 }
+
 
 
 # ======================================
