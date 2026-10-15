@@ -72,7 +72,7 @@ jobs:
           tar -xzf $archive.FullName -C unpacked
           Get-ChildItem unpacked -Depth 2 | Select-Object FullName
 
-      - name: Verify bundled runtime
+      - name: Verify bundled runtime and offline launcher
         shell: pwsh
         run: |
           $root = Resolve-Path 'unpacked/windows-modern'
@@ -83,6 +83,7 @@ jobs:
           if ($v.Trim() -ne '1.3.14') { throw "expected Bun 1.3.14, got $v" }
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
           if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
+          if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher does not disable OpenCode auto-update' }
 
       - name: Smoke test CLI without auto-update
         shell: pwsh
