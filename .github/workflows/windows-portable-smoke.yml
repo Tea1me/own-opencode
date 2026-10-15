@@ -63,7 +63,7 @@ jobs:
           name: windows-modern-smoke
           path: artifact
 
-      - name: Extract
+      - name: Extract portable
         shell: pwsh
         run: |
           $archive = Get-ChildItem artifact -Filter *.tar.gz | Select-Object -First 1
@@ -71,8 +71,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path unpacked | Out-Null
           tar -xzf $archive.FullName -C unpacked
 
-      - name: Verify bundled runtime and offline launcher
+      - name: Verify bundled runtime and CLI commands
         shell: pwsh
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: '1'
         run: |
           $root = Resolve-Path 'unpacked/windows-modern'
           $bun = Join-Path $root 'runtime/bun/bun.exe'
@@ -83,123 +85,34 @@ jobs:
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
           if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
           if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher does not disable OpenCode auto-update' }
-
-      - name: Smoke test CLI commands
-        shell: pwsh
-        env:
-          OPENCODE_DISABLE_AUTOUPDATE: '1'
-        run: |
-          $root = Resolve-Path 'unpacked/windows-modern'
           Push-Location $root
           try {
             cmd /d /c "opencode.bat --version"
             if ($LASTEXITCODE -ne 0) { throw "opencode --version failed with $LASTEXITCODE" }
             cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
-            if ($LASTEXITCODE -ne 0) {
-              Get-Content smoke-help.txt
-              throw "opencode --help failed with $LASTEXITCODE"
-            }
-          }
-          finally {
-            Pop-Location
-          }
+            if ($LASTEXITCODE -ne 0) { Get-Content smoke-help.txt; throw "opencode --help failed" }
+          } finally { Pop-Location }
+
+      - name: Download official Windows CLI for control test
+        shell: pwsh
+        run: |
+          $tag = '${{ needs.build.outputs.tag }}'
+          $url = "https://github.com/anomalyco/opencode/releases/download/$tag/opencode-windows-x64.zip"
+          Write-Host "Downloading control: $url"
+          curl.exe -fL --retry 3 -o official.zip $url
+          New-Item -ItemType Directory -Force -Path official | Out-Null
+          Expand-Archive -Path official.zip -DestinationPath official -Force
+          Get-ChildItem official -Recurse | Select-Object FullName,Length
+          $exe = Get-ChildItem official -Recurse -Filter opencode.exe | Select-Object -First 1
+          if (-not $exe) { throw 'official opencode.exe missing' }
+          & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw 'official --version failed' }
 
       - name: Install ConPTY test helper
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: Isolate OpenTUI renderer startup in ConPTY
-        shell: pwsh
-        run: |
-          $root = Resolve-Path 'unpacked/windows-modern'
-          @'
-          import { createCliRenderer } from "@opentui/core"
-
-          console.error("[probe] before createCliRenderer")
-          const renderer = await createCliRenderer({
-            targetFps: 30,
-            exitOnCtrlC: false,
-            useAlternateScreen: false,
-            useMouse: false,
-          })
-          console.error("[probe] after createCliRenderer")
-          await Bun.sleep(1200)
-          renderer.destroy()
-          console.error("[probe] destroyed")
-          process.exit(0)
-          '@ | Set-Content -Encoding UTF8 (Join-Path $root 'opentui_probe.ts')
-
-          @'
-          import os
-          import re
-          import threading
-          import time
-          from winpty import PtyProcess
-
-          root = os.path.abspath(r"unpacked\windows-modern")
-          bun = os.path.join(root, "runtime", "bun", "bun.exe")
-          probe = os.path.join(root, "opentui_probe.ts")
-
-          def run_case(label, env_updates):
-              print(f"===== OPENTUI PROBE {label} env={env_updates!r} =====")
-              saved = {}
-              for key, value in env_updates.items():
-                  saved[key] = os.environ.get(key)
-                  os.environ[key] = value
-              try:
-                  proc = PtyProcess.spawn([bun, "--no-install", probe], cwd=root, dimensions=(120, 40))
-              finally:
-                  for key, value in saved.items():
-                      if value is None:
-                          os.environ.pop(key, None)
-                      else:
-                          os.environ[key] = value
-
-              chunks = []
-              def reader():
-                  try:
-                      while proc.isalive():
-                          data = proc.read(4096)
-                          if data:
-                              chunks.append(data)
-                  except (EOFError, OSError):
-                      pass
-
-              thread = threading.Thread(target=reader, daemon=True)
-              thread.start()
-              deadline = time.time() + 8
-              while proc.isalive() and time.time() < deadline:
-                  time.sleep(0.2)
-              alive = proc.isalive()
-              if alive:
-                  proc.terminate(force=True)
-              thread.join(timeout=2)
-
-              output = "".join(chunks)
-              print(repr(output[:16000]))
-              after = "[probe] after createCliRenderer" in output
-              destroyed = "[probe] destroyed" in output
-              print(f"RESULT {label}: after_create={after} destroyed={destroyed} alive_after_8s={alive}")
-              return output, after, destroyed
-
-          base = run_case("baseline", {})
-          console = run_case("console-control", {"OT_USE_CONSOLE_CONTROL": "true"})
-          safe = run_case("console-control-no-kitty", {
-              "OT_USE_CONSOLE_CONTROL": "true",
-              "OT_NO_SAFETY_KITTY_KEYBOARD": "1",
-          })
-
-          print("SUMMARY", {
-              "baseline_after": base[1],
-              "console_after": console[1],
-              "safe_after": safe[1],
-          })
-          if not any(case[1] for case in (base, console, safe)):
-              raise SystemExit("createCliRenderer hangs in every tested Windows terminal mode")
-          '@ | Set-Content -Encoding UTF8 opentui_probe_runner.py
-          python opentui_probe_runner.py
-
-      - name: Interactive OpenCode TUI smoke in ConPTY
+      - name: Compare official and portable TUI in identical ConPTY
         shell: pwsh
         env:
           OPENCODE_DISABLE_AUTOUPDATE: '1'
@@ -212,43 +125,67 @@ jobs:
           import time
           from winpty import PtyProcess
 
-          root = os.path.abspath(r"unpacked\windows-modern")
-          bat = os.path.join(root, "opencode.bat")
-          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=root, dimensions=(120, 40))
-          chunks = []
+          workspace = os.getcwd()
+          portable_root = os.path.abspath(r"unpacked\windows-modern")
+          portable_bat = os.path.join(portable_root, "opencode.bat")
 
-          def reader():
-              try:
-                  while proc.isalive():
-                      data = proc.read(4096)
-                      if data:
-                          chunks.append(data)
-              except (EOFError, OSError):
-                  pass
+          official_candidates = []
+          for base, _, files in os.walk(os.path.abspath("official")):
+              for name in files:
+                  if name.lower() == "opencode.exe":
+                      official_candidates.append(os.path.join(base, name))
+          if not official_candidates:
+              raise SystemExit("official opencode.exe not found")
+          official_exe = official_candidates[0]
 
-          thread = threading.Thread(target=reader, daemon=True)
-          thread.start()
-          time.sleep(12)
-          if proc.isalive():
-              try:
-                  proc.write("\x03")
-              except Exception:
-                  pass
-              time.sleep(1)
-          if proc.isalive():
-              proc.terminate(force=True)
-          thread.join(timeout=2)
+          def clean_text(output):
+              clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+              clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
+              clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+              clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
+              return clean.strip()
 
-          output = "".join(chunks)
-          print(repr(output[:16000]))
-          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
-          clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
-          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
-          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
-          printable = clean.strip()
-          print(printable[:12000])
-          print(f"printable chars={len(printable)}")
-          if len(printable) < 80:
-              raise SystemExit("interactive TUI produced too little terminal output; likely blank or hung")
-          '@ | Set-Content -Encoding UTF8 opencode_tui_smoke.py
-          python opencode_tui_smoke.py
+          def run_case(label, argv, cwd):
+              print(f"===== {label}: {argv!r} =====")
+              proc = PtyProcess.spawn(argv, cwd=cwd, dimensions=(120, 40))
+              chunks = []
+              def reader():
+                  try:
+                      while proc.isalive():
+                          data = proc.read(4096)
+                          if data:
+                              chunks.append(data)
+                  except (EOFError, OSError):
+                      pass
+              t = threading.Thread(target=reader, daemon=True)
+              t.start()
+              time.sleep(12)
+              alive = proc.isalive()
+              if alive:
+                  try:
+                      proc.write("\x03")
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              if proc.isalive():
+                  proc.terminate(force=True)
+              t.join(timeout=2)
+              output = "".join(chunks)
+              text = clean_text(output)
+              print(f"----- {label} raw -----")
+              print(repr(output[:16000]))
+              print(f"----- {label} printable -----")
+              print(text[:12000])
+              print(f"RESULT {label}: printable={len(text)} alive_after_12s={alive}")
+              return output, text
+
+          portable = run_case("portable", ["cmd.exe", "/d", "/c", portable_bat], portable_root)
+          official = run_case("official", [official_exe], os.path.dirname(official_exe))
+
+          print(f"SUMMARY portable={len(portable[1])} official={len(official[1])}")
+          if len(official[1]) < 80:
+              raise SystemExit("official binary is also blank in CI ConPTY; ConPTY is not a valid render oracle")
+          if len(portable[1]) < 80:
+              raise SystemExit("official binary renders but portable TUI is blank")
+          '@ | Set-Content -Encoding UTF8 tui_control_compare.py
+          python tui_control_compare.py
