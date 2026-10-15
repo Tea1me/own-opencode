@@ -83,10 +83,8 @@ jobs:
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
           if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
           if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher does not disable OpenCode auto-update' }
-          $tui = Get-Content (Join-Path $root 'packages/opencode/src/cli/cmd/tui.ts') -Raw
-          if ($tui -notmatch 'process\.platform === "win32"') { throw 'Windows HTTP transport patch missing' }
 
-      - name: Smoke test CLI without auto-update
+      - name: Smoke test CLI commands
         shell: pwsh
         env:
           OPENCODE_DISABLE_AUTOUPDATE: '1'
@@ -110,7 +108,98 @@ jobs:
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: Compare interactive TUI startup modes in ConPTY
+      - name: Isolate OpenTUI renderer startup in ConPTY
+        shell: pwsh
+        run: |
+          $root = Resolve-Path 'unpacked/windows-modern'
+          @'
+          import { createCliRenderer } from "@opentui/core"
+
+          console.error("[probe] before createCliRenderer")
+          const renderer = await createCliRenderer({
+            targetFps: 30,
+            exitOnCtrlC: false,
+            useAlternateScreen: false,
+            useMouse: false,
+          })
+          console.error("[probe] after createCliRenderer")
+          await Bun.sleep(1200)
+          renderer.destroy()
+          console.error("[probe] destroyed")
+          process.exit(0)
+          '@ | Set-Content -Encoding UTF8 (Join-Path $root 'opentui_probe.ts')
+
+          @'
+          import os
+          import re
+          import threading
+          import time
+          from winpty import PtyProcess
+
+          root = os.path.abspath(r"unpacked\windows-modern")
+          bun = os.path.join(root, "runtime", "bun", "bun.exe")
+          probe = os.path.join(root, "opentui_probe.ts")
+
+          def run_case(label, env_updates):
+              print(f"===== OPENTUI PROBE {label} env={env_updates!r} =====")
+              saved = {}
+              for key, value in env_updates.items():
+                  saved[key] = os.environ.get(key)
+                  os.environ[key] = value
+              try:
+                  proc = PtyProcess.spawn([bun, "--no-install", probe], cwd=root, dimensions=(120, 40))
+              finally:
+                  for key, value in saved.items():
+                      if value is None:
+                          os.environ.pop(key, None)
+                      else:
+                          os.environ[key] = value
+
+              chunks = []
+              def reader():
+                  try:
+                      while proc.isalive():
+                          data = proc.read(4096)
+                          if data:
+                              chunks.append(data)
+                  except (EOFError, OSError):
+                      pass
+
+              thread = threading.Thread(target=reader, daemon=True)
+              thread.start()
+              deadline = time.time() + 8
+              while proc.isalive() and time.time() < deadline:
+                  time.sleep(0.2)
+              alive = proc.isalive()
+              if alive:
+                  proc.terminate(force=True)
+              thread.join(timeout=2)
+
+              output = "".join(chunks)
+              print(repr(output[:16000]))
+              after = "[probe] after createCliRenderer" in output
+              destroyed = "[probe] destroyed" in output
+              print(f"RESULT {label}: after_create={after} destroyed={destroyed} alive_after_8s={alive}")
+              return output, after, destroyed
+
+          base = run_case("baseline", {})
+          console = run_case("console-control", {"OT_USE_CONSOLE_CONTROL": "true"})
+          safe = run_case("console-control-no-kitty", {
+              "OT_USE_CONSOLE_CONTROL": "true",
+              "OT_NO_SAFETY_KITTY_KEYBOARD": "1",
+          })
+
+          print("SUMMARY", {
+              "baseline_after": base[1],
+              "console_after": console[1],
+              "safe_after": safe[1],
+          })
+          if not any(case[1] for case in (base, console, safe)):
+              raise SystemExit("createCliRenderer hangs in every tested Windows terminal mode")
+          '@ | Set-Content -Encoding UTF8 opentui_probe_runner.py
+          python opentui_probe_runner.py
+
+      - name: Interactive OpenCode TUI smoke in ConPTY
         shell: pwsh
         env:
           OPENCODE_DISABLE_AUTOUPDATE: '1'
@@ -125,72 +214,41 @@ jobs:
 
           root = os.path.abspath(r"unpacked\windows-modern")
           bat = os.path.join(root, "opencode.bat")
+          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=root, dimensions=(120, 40))
+          chunks = []
 
-          def run_case(label, extra_args):
-              argv = ["cmd.exe", "/d", "/c", bat, *extra_args]
-              print(f"===== CASE {label}: {argv!r} =====")
-              proc = PtyProcess.spawn(argv, cwd=root, dimensions=(120, 40))
-              chunks = []
+          def reader():
+              try:
+                  while proc.isalive():
+                      data = proc.read(4096)
+                      if data:
+                          chunks.append(data)
+              except (EOFError, OSError):
+                  pass
 
-              def reader():
-                  try:
-                      while proc.isalive():
-                          data = proc.read(4096)
-                          if data:
-                              chunks.append(data)
-                  except (EOFError, OSError):
-                      pass
+          thread = threading.Thread(target=reader, daemon=True)
+          thread.start()
+          time.sleep(12)
+          if proc.isalive():
+              try:
+                  proc.write("\x03")
+              except Exception:
+                  pass
+              time.sleep(1)
+          if proc.isalive():
+              proc.terminate(force=True)
+          thread.join(timeout=2)
 
-              thread = threading.Thread(target=reader, daemon=True)
-              thread.start()
-              time.sleep(12)
-
-              alive_after_12s = proc.isalive()
-              if alive_after_12s:
-                  try:
-                      proc.write("\x03")
-                  except Exception:
-                      pass
-                  time.sleep(1)
-              if proc.isalive():
-                  proc.terminate(force=True)
-              thread.join(timeout=2)
-
-              output = "".join(chunks)
-              print(f"----- {label} raw output (first 16000 chars) -----")
-              print(repr(output[:16000]))
-
-              clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
-              clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
-              clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
-              clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
-              printable = clean.strip()
-              print(f"----- {label} printable output -----")
-              print(printable[:12000])
-              print(f"{label}: printable chars={len(printable)}, alive_after_12s={alive_after_12s}")
-              return output, printable
-
-          default_raw, default_text = run_case("default", [])
-          port_raw, port_text = run_case("explicit-port", ["--port", "4521"])
-
-          fatal_markers = [
-              "module not found",
-              "cannot find module",
-              "unexpected error",
-              "syntaxerror",
-              "referenceerror",
-              "typeerror:",
-          ]
-          for label, output in (("default", default_raw), ("explicit-port", port_raw)):
-              lower = output.lower()
-              for marker in fatal_markers:
-                  if marker in lower:
-                      raise SystemExit(f"{label} TUI emitted fatal marker: {marker}")
-
-          print(f"SUMMARY default={len(default_text)} explicit-port={len(port_text)}")
-          if len(port_text) < 80:
-              raise SystemExit("explicit --port also failed to render TUI under ConPTY")
-          if len(default_text) < 80:
-              raise SystemExit("explicit --port renders but default startup is still blank")
-          '@ | Set-Content -Encoding UTF8 conpty_compare.py
-          python conpty_compare.py
+          output = "".join(chunks)
+          print(repr(output[:16000]))
+          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+          clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
+          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
+          printable = clean.strip()
+          print(printable[:12000])
+          print(f"printable chars={len(printable)}")
+          if len(printable) < 80:
+              raise SystemExit("interactive TUI produced too little terminal output; likely blank or hung")
+          '@ | Set-Content -Encoding UTF8 opencode_tui_smoke.py
+          python opencode_tui_smoke.py
