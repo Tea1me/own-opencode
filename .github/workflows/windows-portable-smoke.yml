@@ -1,0 +1,105 @@
+name: Windows Portable Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'build/windows-modern-portable.sh'
+      - '.github/workflows/windows-portable-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y wget jq unzip
+
+      - name: Resolve latest OpenCode release
+        id: version
+        shell: bash
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r .tag_name)
+          test -n "$tag" && test "$tag" != "null"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using OpenCode $tag"
+
+      - name: Setup Bun 1.3.14
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Build Windows modern portable
+        shell: bash
+        run: |
+          chmod +x build/windows-modern-portable.sh
+          ./build/windows-modern-portable.sh '${{ steps.version.outputs.tag }}'
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-modern-smoke
+          path: dist/opencode-${{ steps.version.outputs.tag }}-portable-windows-modern-x64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download portable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-modern-smoke
+          path: artifact
+
+      - name: Extract
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem artifact -Filter *.tar.gz | Select-Object -First 1
+          if (-not $archive) { throw 'portable archive missing' }
+          New-Item -ItemType Directory -Force -Path unpacked | Out-Null
+          tar -xzf $archive.FullName -C unpacked
+          Get-ChildItem unpacked -Depth 2 | Select-Object FullName
+
+      - name: Verify bundled runtime
+        shell: pwsh
+        run: |
+          $root = Resolve-Path 'unpacked/windows-modern'
+          $bun = Join-Path $root 'runtime/bun/bun.exe'
+          if (-not (Test-Path $bun)) { throw 'bundled bun.exe missing' }
+          $v = & $bun --version
+          if ($LASTEXITCODE -ne 0) { throw 'bun --version failed' }
+          if ($v.Trim() -ne '1.3.14') { throw "expected Bun 1.3.14, got $v" }
+          $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
+          if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
+
+      - name: Smoke test CLI without auto-update
+        shell: pwsh
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: '1'
+        run: |
+          $root = Resolve-Path 'unpacked/windows-modern'
+          Push-Location $root
+          try {
+            cmd /d /c "opencode.bat --version"
+            if ($LASTEXITCODE -ne 0) { throw "opencode --version failed with $LASTEXITCODE" }
+            cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-help.txt
+              throw "opencode --help failed with $LASTEXITCODE"
+            }
+            Get-Content smoke-help.txt | Select-Object -First 80
+          }
+          finally {
+            Pop-Location
+          }
