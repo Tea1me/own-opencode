@@ -70,7 +70,6 @@ jobs:
           if (-not $archive) { throw 'portable archive missing' }
           New-Item -ItemType Directory -Force -Path unpacked | Out-Null
           tar -xzf $archive.FullName -C unpacked
-          Get-ChildItem unpacked -Depth 2 | Select-Object FullName
 
       - name: Verify bundled runtime and offline launcher
         shell: pwsh
@@ -84,6 +83,8 @@ jobs:
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
           if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
           if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher does not disable OpenCode auto-update' }
+          $tui = Get-Content (Join-Path $root 'packages/opencode/src/cli/cmd/tui.ts') -Raw
+          if ($tui -notmatch 'process\.platform === "win32"') { throw 'Windows HTTP transport patch missing' }
 
       - name: Smoke test CLI without auto-update
         shell: pwsh
@@ -100,7 +101,6 @@ jobs:
               Get-Content smoke-help.txt
               throw "opencode --help failed with $LASTEXITCODE"
             }
-            Get-Content smoke-help.txt | Select-Object -First 80
           }
           finally {
             Pop-Location
@@ -110,7 +110,7 @@ jobs:
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: Interactive TUI smoke in ConPTY
+      - name: Compare interactive TUI startup modes in ConPTY
         shell: pwsh
         env:
           OPENCODE_DISABLE_AUTOUPDATE: '1'
@@ -125,37 +125,54 @@ jobs:
 
           root = os.path.abspath(r"unpacked\windows-modern")
           bat = os.path.join(root, "opencode.bat")
-          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=root, dimensions=(120, 40))
-          chunks = []
 
-          def reader():
-              try:
-                  while proc.isalive():
-                      data = proc.read(4096)
-                      if data:
-                          chunks.append(data)
-              except (EOFError, OSError):
-                  pass
+          def run_case(label, extra_args):
+              argv = ["cmd.exe", "/d", "/c", bat, *extra_args]
+              print(f"===== CASE {label}: {argv!r} =====")
+              proc = PtyProcess.spawn(argv, cwd=root, dimensions=(120, 40))
+              chunks = []
 
-          thread = threading.Thread(target=reader, daemon=True)
-          thread.start()
-          time.sleep(12)
+              def reader():
+                  try:
+                      while proc.isalive():
+                          data = proc.read(4096)
+                          if data:
+                              chunks.append(data)
+                  except (EOFError, OSError):
+                      pass
 
-          if proc.isalive():
-              try:
-                  proc.write("\x03")
-              except Exception:
-                  pass
-              time.sleep(2)
-          if proc.isalive():
-              proc.terminate(force=True)
+              thread = threading.Thread(target=reader, daemon=True)
+              thread.start()
+              time.sleep(12)
 
-          thread.join(timeout=2)
-          output = "".join(chunks)
-          print("----- ConPTY raw output (first 16000 chars) -----")
-          print(repr(output[:16000]))
+              alive_after_12s = proc.isalive()
+              if alive_after_12s:
+                  try:
+                      proc.write("\x03")
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              if proc.isalive():
+                  proc.terminate(force=True)
+              thread.join(timeout=2)
 
-          lower = output.lower()
+              output = "".join(chunks)
+              print(f"----- {label} raw output (first 16000 chars) -----")
+              print(repr(output[:16000]))
+
+              clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+              clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
+              clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+              clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
+              printable = clean.strip()
+              print(f"----- {label} printable output -----")
+              print(printable[:12000])
+              print(f"{label}: printable chars={len(printable)}, alive_after_12s={alive_after_12s}")
+              return output, printable
+
+          default_raw, default_text = run_case("default", [])
+          port_raw, port_text = run_case("explicit-port", ["--port", "4521"])
+
           fatal_markers = [
               "module not found",
               "cannot find module",
@@ -164,20 +181,16 @@ jobs:
               "referenceerror",
               "typeerror:",
           ]
-          for marker in fatal_markers:
-              if marker in lower:
-                  raise SystemExit(f"interactive TUI emitted fatal marker: {marker}")
+          for label, output in (("default", default_raw), ("explicit-port", port_raw)):
+              lower = output.lower()
+              for marker in fatal_markers:
+                  if marker in lower:
+                      raise SystemExit(f"{label} TUI emitted fatal marker: {marker}")
 
-          # Strip ANSI/OSC/control sequences. A real TUI redraw should still leave
-          # plenty of printable text; a blank/hung process will not.
-          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
-          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
-          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
-          printable = clean.strip()
-          print("----- ConPTY printable output -----")
-          print(printable[:12000])
-          print(f"printable chars: {len(printable)}")
-          if len(printable) < 80:
-              raise SystemExit("interactive TUI produced too little terminal output; likely blank or hung")
-          '@ | Set-Content -Encoding UTF8 conpty_smoke.py
-          python conpty_smoke.py
+          print(f"SUMMARY default={len(default_text)} explicit-port={len(port_text)}")
+          if len(port_text) < 80:
+              raise SystemExit("explicit --port also failed to render TUI under ConPTY")
+          if len(default_text) < 80:
+              raise SystemExit("explicit --port renders but default startup is still blank")
+          '@ | Set-Content -Encoding UTF8 conpty_compare.py
+          python conpty_compare.py
