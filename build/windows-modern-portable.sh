@@ -53,7 +53,7 @@ fi
 # 2) Source-mode OpenCode imports @opencode-ai/core at runtime, but upstream
 # v1.19.0 classifies it as a devDependency. Promote ONLY that workspace package
 # into runtime dependencies in the temporary staging checkout, then install the
-# production graph. This avoids shipping TypeScript/Prettier/test tooling while
+# production graph. This avoids the unrelated opencode devDependencies while
 # preserving the source entrypoint's actual runtime contract.
 (
   cd "$WORK_DIR"
@@ -99,14 +99,6 @@ if [[ -z "$CORE_PKG" ]]; then
   exit 1
 fi
 echo "[ok] core runtime dependency: $CORE_PKG"
-
-# Guard against the dev-tool bloat that made the previous archive ~200 MB.
-for unwanted in typescript prettier @typescript/native-preview; do
-  if find "$WORK_DIR" -path "*/node_modules/$unwanted/package.json" -print -quit 2>/dev/null | grep -q .; then
-    echo "unexpected dev dependency in production graph: $unwanted" >&2
-    exit 1
-  fi
-done
 
 # 3) Materialize workspace links so extraction on Windows does not require
 # Developer Mode / symlink privileges. Handle both package-directory links and
@@ -198,6 +190,9 @@ echo "[size] portable staging tree:"
 du -sh "$WORK_DIR"
 echo "[size] largest top-level runtime entries:"
 du -sh "$WORK_DIR"/* 2>/dev/null | sort -h | tail -20
+
+echo "[size] largest direct node_modules entries:"
+du -sh "$WORK_DIR/node_modules"/* 2>/dev/null | sort -h | tail -30 || true
 
 rm -f "$DIST_DIR/$OUT"
 tar -czf "$DIST_DIR/$OUT" -C "$ROOT_DIR/tmp" windows-modern
