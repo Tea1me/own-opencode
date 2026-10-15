@@ -50,14 +50,29 @@ if [[ "$(bun --version)" != "1.3.14" ]]; then
   exit 1
 fi
 
-# 2) Install ONLY the opencode workspace graph. Do NOT use --production:
-# src/index.ts imports @opencode-ai/core at runtime although upstream lists core
-# in devDependencies. The previous '!./' filter pulled almost the whole monorepo
-# (Electron/Playwright/Storybook/etc.) and produced an 883 MB artifact.
+# 2) Source-mode OpenCode imports @opencode-ai/core at runtime, but upstream
+# v1.19.0 classifies it as a devDependency. Promote ONLY that workspace package
+# into runtime dependencies in the temporary staging checkout, then install the
+# production graph. This avoids shipping TypeScript/Prettier/test tooling while
+# preserving the source entrypoint's actual runtime contract.
 (
   cd "$WORK_DIR"
+  python3 - <<'PY'
+import json
+from pathlib import Path
+p = Path("packages/opencode/package.json")
+data = json.loads(p.read_text(encoding="utf-8"))
+dev = data.setdefault("devDependencies", {})
+core = dev.pop("@opencode-ai/core", None)
+if core is None:
+    raise SystemExit("@opencode-ai/core missing from opencode devDependencies")
+data.setdefault("dependencies", {})["@opencode-ai/core"] = core
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+
   bun install \
     --frozen-lockfile \
+    --production \
     --filter './packages/opencode' \
     --os=win32 \
     --cpu=x64 \
@@ -84,6 +99,14 @@ if [[ -z "$CORE_PKG" ]]; then
   exit 1
 fi
 echo "[ok] core runtime dependency: $CORE_PKG"
+
+# Guard against the dev-tool bloat that made the previous archive ~200 MB.
+for unwanted in typescript prettier @typescript/native-preview; do
+  if find "$WORK_DIR" -path "*/node_modules/$unwanted/package.json" -print -quit 2>/dev/null | grep -q .; then
+    echo "unexpected dev dependency in production graph: $unwanted" >&2
+    exit 1
+  fi
+done
 
 # 3) Materialize workspace links so extraction on Windows does not require
 # Developer Mode / symlink privileges. Handle both package-directory links and
@@ -157,7 +180,6 @@ sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 # - packages/opencode (entrypoint + its assets/tsconfig/package.json)
 # - node_modules (installed graph, including materialized workspace packages)
 # - runtime/bun + launcher
-# Everything else was build/repo material and caused huge archives.
 find "$WORK_DIR/packages" -mindepth 1 -maxdepth 1 ! -name opencode -exec rm -rf {} +
 find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
   ! -name packages \
