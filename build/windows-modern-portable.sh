@@ -81,6 +81,12 @@ set "XDG_DATA_HOME=%PORTABLE%\data"
 set "XDG_CACHE_HOME=%PORTABLE%\cache"
 set "XDG_STATE_HOME=%PORTABLE%\state"
 
+rem Keep OpenCode/Bun temporary files portable too. HOME/USERPROFILE are left
+rem untouched intentionally so Git, SSH, and user shell configuration continue
+rem to work normally.
+set "TEMP=%PORTABLE%\tmp"
+set "TMP=%PORTABLE%\tmp"
+
 rem Releases are controlled by this portable repository, not by self-update.
 set "OPENCODE_DISABLE_AUTOUPDATE=1"
 
@@ -97,6 +103,8 @@ grep -q -- 'OPENCODE_DB=' "$WORK_DIR/opencode.bat"
 grep -q -- 'XDG_DATA_HOME=' "$WORK_DIR/opencode.bat"
 grep -q -- 'XDG_CACHE_HOME=' "$WORK_DIR/opencode.bat"
 grep -q -- 'XDG_STATE_HOME=' "$WORK_DIR/opencode.bat"
+grep -q -- 'TEMP=%PORTABLE%' "$WORK_DIR/opencode.bat"
+grep -q -- 'TMP=%PORTABLE%' "$WORK_DIR/opencode.bat"
 grep -q -- 'OPENCODE_DISABLE_AUTOUPDATE=1' "$WORK_DIR/opencode.bat"
 
 # Preserve empty portable directories in archives/tools that may drop empties.
