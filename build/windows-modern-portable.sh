@@ -9,20 +9,26 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-WORK_DIR="$ROOT_DIR/tmp/windows-modern"
-ENTRYPOINT="packages/opencode/src/index.ts"
-BUN_TAG="bun-v1.3.14"
-BUN_URL="https://github.com/oven-sh/bun/releases/download/${BUN_TAG}/bun-windows-x64.zip"
-SOURCE_URL="https://github.com/anomalyco/opencode/archive/refs/tags/${VERSION}.tar.gz"
+WORK_PARENT="$ROOT_DIR/tmp"
+WORK_DIR="$WORK_PARENT/windows-modern"
 OUT="opencode-${VERSION}-portable-windows-modern-x64.tar.gz"
+UPSTREAM_ZIP_URL="https://github.com/anomalyco/opencode/releases/download/${VERSION}/opencode-windows-x64.zip"
 
 cleanup() {
-  rm -rf "$ROOT_DIR/tmp/windows-modern"
+  rm -rf "$WORK_DIR" "$WORK_PARENT/windows-official"
 }
 trap cleanup EXIT
 
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR/runtime/bun" "$DIST_DIR"
+rm -rf "$WORK_DIR" "$WORK_PARENT/windows-official"
+mkdir -p \
+  "$WORK_DIR/bin" \
+  "$WORK_DIR/portable-data/config" \
+  "$WORK_DIR/portable-data/data" \
+  "$WORK_DIR/portable-data/cache" \
+  "$WORK_DIR/portable-data/state" \
+  "$WORK_DIR/portable-data/tmp" \
+  "$WORK_PARENT/windows-official" \
+  "$DIST_DIR"
 
 fetch() {
   local url="$1"
@@ -31,201 +37,83 @@ fetch() {
   wget -q --show-progress --tries=3 "$url" -O "$out"
 }
 
-# 1) Fetch the exact upstream source tag.
-fetch "$SOURCE_URL" "$WORK_DIR/source.tar.gz"
-tar -xzf "$WORK_DIR/source.tar.gz" --strip-components=1 -C "$WORK_DIR"
-rm -f "$WORK_DIR/source.tar.gz"
+# Use the exact upstream compiled Windows CLI for this OpenCode tag. The
+# official binary already contains Bun, OpenTUI's Solid transform, embedded
+# workers, build-time version/channel constants, and the platform-specific
+# native dependencies. Running the raw TypeScript source is NOT equivalent to
+# the official build and can leave the interactive TUI blank on Windows.
+fetch "$UPSTREAM_ZIP_URL" "$WORK_PARENT/windows-official/opencode.zip"
+unzip -q "$WORK_PARENT/windows-official/opencode.zip" -d "$WORK_PARENT/windows-official/extracted"
 
-if [[ ! -f "$WORK_DIR/$ENTRYPOINT" ]]; then
-  echo "missing entrypoint: $ENTRYPOINT" >&2
+OFFICIAL_EXE="$(find "$WORK_PARENT/windows-official/extracted" -type f -iname 'opencode.exe' -print -quit)"
+if [[ -z "$OFFICIAL_EXE" || ! -f "$OFFICIAL_EXE" ]]; then
+  echo "official archive did not contain opencode.exe" >&2
   exit 1
 fi
+cp "$OFFICIAL_EXE" "$WORK_DIR/bin/opencode.exe"
 
-if ! command -v bun >/dev/null 2>&1; then
-  echo "CI build requires Bun 1.3.14" >&2
-  exit 1
-fi
-if [[ "$(bun --version)" != "1.3.14" ]]; then
-  echo "expected build Bun 1.3.14, got $(bun --version)" >&2
-  exit 1
-fi
-
-# 2) Windows TUI transport workaround.
-# Upstream v1.19.0 defaults to an in-process Worker RPC transport when no
-# --port/--hostname is supplied. On Windows that path can hang indefinitely
-# before the first TUI frame is rendered. The explicit-port path uses the
-# worker-hosted real HTTP server and is known to avoid the deadlock.
-#
-# For this Windows-only portable build, force the same external HTTP path while
-# keeping the normal default port value (0), so the OS still chooses a free
-# ephemeral port and users do not need a fixed port or launcher argument hack.
-(
-  cd "$WORK_DIR"
-  python3 - <<'PY'
-from pathlib import Path
-
-p = Path("packages/opencode/src/cli/cmd/tui.ts")
-text = p.read_text(encoding="utf-8")
-old = 'const external = hasArg("--port") || hasArg("--hostname") || network.mdns === true'
-new = 'const external = process.platform === "win32" || hasArg("--port") || hasArg("--hostname") || network.mdns === true'
-count = text.count(old)
-if count != 1:
-    raise SystemExit(f"expected exactly one TUI transport expression, found {count}")
-p.write_text(text.replace(old, new), encoding="utf-8")
-print("[ok] patched Windows TUI to use external HTTP transport")
-PY
-)
-
-# 3) Source-mode OpenCode imports @opencode-ai/core at runtime, but upstream
-# v1.19.0 classifies it as a devDependency. Promote ONLY that workspace package
-# into runtime dependencies in the temporary staging checkout, then install the
-# production graph. This avoids the unrelated opencode devDependencies while
-# preserving the source entrypoint's actual runtime contract.
-(
-  cd "$WORK_DIR"
-  python3 - <<'PY'
-import json
-from pathlib import Path
-p = Path("packages/opencode/package.json")
-data = json.loads(p.read_text(encoding="utf-8"))
-dev = data.setdefault("devDependencies", {})
-core = dev.pop("@opencode-ai/core", None)
-if core is None:
-    raise SystemExit("@opencode-ai/core missing from opencode devDependencies")
-data.setdefault("dependencies", {})["@opencode-ai/core"] = core
-p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-PY
-
-  bun install \
-    --frozen-lockfile \
-    --production \
-    --filter './packages/opencode' \
-    --os=win32 \
-    --cpu=x64 \
-    --backend=copyfile \
-    --linker=hoisted \
-    --ignore-scripts \
-    --no-progress
-)
-
-CORE_PKG=""
-for candidate in \
-  "$WORK_DIR/packages/opencode/node_modules/@opencode-ai/core/package.json" \
-  "$WORK_DIR/node_modules/@opencode-ai/core/package.json"; do
-  if [[ -e "$candidate" ]]; then
-    CORE_PKG="$candidate"
-    break
-  fi
-done
-if [[ -z "$CORE_PKG" ]]; then
-  CORE_PKG="$(find -L "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/package.json' -print -quit 2>/dev/null || true)"
-fi
-if [[ -z "$CORE_PKG" ]]; then
-  echo "source runtime dependency @opencode-ai/core was not installed" >&2
-  exit 1
-fi
-echo "[ok] core runtime dependency: $CORE_PKG"
-
-# 4) Materialize workspace links so extraction on Windows does not require
-# Developer Mode / symlink privileges. Handle both package-directory links and
-# .bin file links.
-WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
-materialized_dirs=0
-materialized_files=0
-while IFS= read -r -d '' link; do
-  target="$(readlink -f "$link" 2>/dev/null || true)"
-  case "$target" in
-    "$WORK_ABS"/packages/*)
-      if [[ -d "$target" ]]; then
-        tmp_copy="${link}.portable-copy"
-        rm -rf "$tmp_copy"
-        mkdir -p "$tmp_copy"
-        cp -a "$target"/. "$tmp_copy"/
-        rm -rf "$tmp_copy/node_modules"
-        rm -f "$link"
-        mv "$tmp_copy" "$link"
-        materialized_dirs=$((materialized_dirs + 1))
-      elif [[ -f "$target" ]]; then
-        rm -f "$link"
-        cp -a "$target" "$link"
-        materialized_files=$((materialized_files + 1))
-      else
-        echo "unsupported workspace symlink target: $link -> $target" >&2
-        exit 1
-      fi
-      ;;
-  esac
-done < <(find "$WORK_DIR" -type l -path '*/node_modules/*' -print0)
-echo "[ok] materialized workspace links: dirs=$materialized_dirs files=$materialized_files"
-
-CORE_VERSION_FILE="$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit 2>/dev/null || true)"
-if [[ -z "$CORE_VERSION_FILE" ]]; then
-  echo "materialized core workspace is incomplete" >&2
-  exit 1
-fi
-
-# 5) Bundle the exact Bun version expected by OpenCode v1.19.x.
-fetch "$BUN_URL" "$WORK_DIR/bun.zip"
-unzip -q "$WORK_DIR/bun.zip" -d "$WORK_DIR/runtime/bun"
-rm -f "$WORK_DIR/bun.zip"
-
-if [[ ! -f "$WORK_DIR/runtime/bun/bun.exe" ]]; then
-  bun_exe="$(find "$WORK_DIR/runtime/bun" -type f -name bun.exe -print -quit)"
-  if [[ -z "$bun_exe" ]]; then
-    echo "bun.exe not found after unzip" >&2
-    exit 1
-  fi
-  mv "$bun_exe" "$WORK_DIR/runtime/bun/bun.exe"
-fi
-
-# 6) Strict launcher: portable runtime must neither auto-install missing imports
-# nor self-update behind the user's back. Releases are controlled by this repo.
+# Keep the executable below bin/ so adding the portable root to PATH resolves
+# `opencode` to opencode.bat instead of bypassing the portable environment via
+# PATHEXT's .EXE-before-.BAT ordering.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-set "OPENCODE_ENTRYPOINT=packages\opencode\src\index.ts"
+
+set "ROOT=%~dp0"
+set "PORTABLE=%ROOT%portable-data"
+
+if not exist "%PORTABLE%\config" mkdir "%PORTABLE%\config"
+if not exist "%PORTABLE%\data" mkdir "%PORTABLE%\data"
+if not exist "%PORTABLE%\cache" mkdir "%PORTABLE%\cache"
+if not exist "%PORTABLE%\state" mkdir "%PORTABLE%\state"
+if not exist "%PORTABLE%\tmp" mkdir "%PORTABLE%\tmp"
+
+rem Keep OpenCode's persistent state beside this launcher.
+set "OPENCODE_CONFIG_DIR=%PORTABLE%\config"
+set "OPENCODE_DB=%PORTABLE%\data\opencode.db"
+set "XDG_CONFIG_HOME=%PORTABLE%\config"
+set "XDG_DATA_HOME=%PORTABLE%\data"
+set "XDG_CACHE_HOME=%PORTABLE%\cache"
+set "XDG_STATE_HOME=%PORTABLE%\state"
+
+rem Releases are controlled by this portable repository, not by self-update.
 set "OPENCODE_DISABLE_AUTOUPDATE=1"
-if not exist "runtime\bun\bun.exe" (
-  echo [ERROR] Bun runtime not found!
-  exit /b 1
-)
-for /f "delims=" %%b in ('"runtime\bun\bun.exe" --version') do echo [INFO] Bun %%b
-"runtime\bun\bun.exe" --no-install "%OPENCODE_ENTRYPOINT%" %*
+
+"%ROOT%bin\opencode.exe" %*
 exit /b %ERRORLEVEL%
 BAT
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
-# 7) Prune the source checkout aggressively. Runtime resolution only needs:
-# - packages/opencode (entrypoint + its assets/tsconfig/package.json)
-# - node_modules (installed graph, including materialized workspace packages)
-# - runtime/bun + launcher
-find "$WORK_DIR/packages" -mindepth 1 -maxdepth 1 ! -name opencode -exec rm -rf {} +
-find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
-  ! -name packages \
-  ! -name node_modules \
-  ! -name runtime \
-  ! -name opencode.bat \
-  -exec rm -rf {} +
-
-# 8) Build-time assertions + size diagnostics.
-grep -q -- '--no-install' "$WORK_DIR/opencode.bat"
+# Build assertions.
+test -f "$WORK_DIR/bin/opencode.exe"
+grep -q -- 'OPENCODE_CONFIG_DIR=' "$WORK_DIR/opencode.bat"
+grep -q -- 'OPENCODE_DB=' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_DATA_HOME=' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_CACHE_HOME=' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_STATE_HOME=' "$WORK_DIR/opencode.bat"
 grep -q -- 'OPENCODE_DISABLE_AUTOUPDATE=1' "$WORK_DIR/opencode.bat"
-grep -q -- 'process.platform === "win32"' "$WORK_DIR/packages/opencode/src/cli/cmd/tui.ts"
-test -f "$WORK_DIR/runtime/bun/bun.exe"
-test -f "$WORK_DIR/packages/opencode/src/index.ts"
-test -n "$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit)"
 
-echo "[size] portable staging tree:"
+# Preserve empty portable directories in archives/tools that may drop empties.
+for dir in config data cache state tmp; do
+  printf 'portable runtime directory\n' > "$WORK_DIR/portable-data/$dir/.keep"
+done
+
+# Verify the downloaded executable matches the requested tag before packing.
+EXPECTED="${VERSION#v}"
+ACTUAL="$("$WORK_DIR/bin/opencode.exe" --version 2>/dev/null | tr -d '\r\n')"
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  echo "version mismatch: requested $EXPECTED, official executable reports $ACTUAL" >&2
+  exit 1
+fi
+echo "[ok] official OpenCode $ACTUAL"
+
+echo "[size] staging tree:"
 du -sh "$WORK_DIR"
-echo "[size] largest top-level runtime entries:"
-du -sh "$WORK_DIR"/* 2>/dev/null | sort -h | tail -20
-
-echo "[size] largest direct node_modules entries:"
-du -sh "$WORK_DIR/node_modules"/* 2>/dev/null | sort -h | tail -30 || true
+du -sh "$WORK_DIR"/* 2>/dev/null | sort -h
 
 rm -f "$DIST_DIR/$OUT"
-tar -czf "$DIST_DIR/$OUT" -C "$ROOT_DIR/tmp" windows-modern
+tar -czf "$DIST_DIR/$OUT" -C "$WORK_PARENT" windows-modern
 ls -lh "$DIST_DIR/$OUT"
 sha256sum "$DIST_DIR/$OUT"
 echo "built: $DIST_DIR/$OUT"
