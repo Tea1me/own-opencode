@@ -127,6 +127,7 @@ build_windows() {
   local version="$1"
   local arch="$2"
   local runtime="$3"
+  local entrypoint="packages/opencode/src/index.ts"
 
   # Windows 仅支持x64
   if [ "$arch" != "x64" ]; then
@@ -135,7 +136,8 @@ build_windows() {
   fi
 
   # 生成最终文件名
-  local final_filename=$(render_filename "$FILENAME_TEMPLATE" "$version" "windows" "$runtime" "$arch")
+  local final_filename
+  final_filename=$(render_filename "$FILENAME_TEMPLATE" "$version" "windows" "$runtime" "$arch")
 
   echo "========================================"
   echo "🪟 构建 Windows 版本 | $version | $arch | $runtime"
@@ -150,12 +152,51 @@ build_windows() {
   tar xf "$win_temp_dir/source.tar.gz" --strip 1 -C "$win_temp_dir"
   rm -f "$win_temp_dir/source.tar.gz"
 
+  # OpenCode 上游真实 CLI 入口是 packages/opencode/src/index.ts
+  if [ ! -f "$win_temp_dir/$entrypoint" ]; then
+    echo "❌ 未找到 OpenCode TypeScript 入口: $entrypoint"
+    exit 1
+  fi
+
+  # 源码方式运行必须把依赖一起装进 portable 包，否则首次运行会在线自动安装依赖。
+  # Actions 在 Linux 上执行，但 Bun 支持 --os/--cpu 为 Windows 目标安装平台依赖。
+  if ! command -v bun >/dev/null 2>&1; then
+    echo "❌ 构建 Windows 源码 portable 包需要 CI 中安装 Bun"
+    echo "   请在 workflow 中为 windows matrix 添加 oven-sh/setup-bun@v2"
+    exit 1
+  fi
+
+  echo "📦 安装 OpenCode Windows x64 运行依赖"
+  (
+    cd "$win_temp_dir"
+    bun install \
+      --production \
+      --frozen-lockfile \
+      --filter './packages/opencode' \
+      --os=win32 \
+      --cpu=x64 \
+      --backend=copyfile \
+      --linker=hoisted \
+      --ignore-scripts
+  )
+
   # 2. 下载对应运行时
   if [ "$runtime" = "modern" ]; then
     echo "🔻 下载 Bun 运行时"
     download_file "$BUN_DOWNLOAD_URL" "$win_temp_dir/bun.zip"
     unzip -q "$win_temp_dir/bun.zip" -d "$win_temp_dir/runtime/bun"
     rm -f "$win_temp_dir/bun.zip"
+
+    # 兼容 Bun zip 内多一层 bun-windows-x64/ 的情况，统一到 runtime/bun/bun.exe
+    if [ ! -f "$win_temp_dir/runtime/bun/bun.exe" ]; then
+      local bun_exe
+      bun_exe=$(find "$win_temp_dir/runtime/bun" -type f -name 'bun.exe' -print -quit || true)
+      if [ -z "$bun_exe" ]; then
+        echo "❌ Bun runtime 解压后未找到 bun.exe"
+        exit 1
+      fi
+      mv "$bun_exe" "$win_temp_dir/runtime/bun/bun.exe"
+    fi
   else
     echo "🔻 下载 Node.js 运行时"
     download_file "$NODE_DOWNLOAD_URL" "$win_temp_dir/node.zip"
@@ -164,41 +205,68 @@ build_windows() {
     mv "$win_temp_dir/runtime/node/node-${NODE_VERSION}-win-x64"/* "$win_temp_dir/runtime/node/"
     rm -rf "$win_temp_dir/runtime/node/node-${NODE_VERSION}-win-x64"
     rm -f "$win_temp_dir/node.zip"
+
+    # Node 18 不能原生执行 .ts；内置一个本地 tsx loader，仍然是源码 + Node runtime 路线。
+    mkdir -p "$win_temp_dir/runtime/tsx"
+    cat > "$win_temp_dir/runtime/tsx/package.json" << 'TSXEOF'
+{
+  "private": true,
+  "dependencies": {
+    "tsx": "4.23.15"
+  }
+}
+TSXEOF
+    (
+      cd "$win_temp_dir/runtime/tsx"
+      bun install \
+        --production \
+        --os=win32 \
+        --cpu=x64 \
+        --backend=copyfile \
+        --linker=hoisted \
+        --ignore-scripts
+    )
   fi
 
   # 3. 生成启动脚本
   echo "📝 生成 Windows 启动脚本"
-  cat > "$win_temp_dir/opencode.bat" << 'EOF'
+  cat > "$win_temp_dir/opencode.bat" << 'EOF_BAT'
 @echo off
-setlocal enabledelayedexpansion
+setlocal EnableExtensions EnableDelayedExpansion
 
-:: 自动检测 Windows 版本
+rem Always run relative to this portable directory, even when launched through PATH.
+cd /d "%~dp0"
+set "OPENCODE_ENTRYPOINT=packages\opencode\src\index.ts"
+
+rem Detect Windows version (keep the original runtime-selection logic).
 set "win_version=0"
 for /f "tokens=2 delims=[]" %%i in ('ver') do (
   for /f "tokens=2" %%j in ('echo %%i ^| findstr /C:"Version"') do set "win_version=%%j"
 )
 
-:: 选择运行时
 if "!win_version!" geq "10.0.17763" (
     echo [INFO] Windows 10+/Server 2019+ detected, using Bun runtime
     if exist "runtime\bun\bun.exe" (
-        runtime\bun\bun.exe index.js %*
+        "runtime\bun\bun.exe" "!OPENCODE_ENTRYPOINT!" %*
     ) else (
         echo [ERROR] Bun runtime not found!
         pause
-        exit 1
+        exit /b 1
     )
 ) else (
     echo [INFO] Windows 7/8/8.1 detected, using Node.js runtime
     if exist "runtime\node\node.exe" (
-        runtime\node\node.exe index.js %*
+        "runtime\node\node.exe" "runtime\tsx\node_modules\tsx\dist\cli.mjs" "!OPENCODE_ENTRYPOINT!" %*
     ) else (
         echo [ERROR] Node.js runtime not found!
         pause
-        exit 1
+        exit /b 1
     )
 )
-EOF
+EOF_BAT
+
+  # cmd.exe 对由 Linux 生成的 LF-only bat 兼容并不稳定，强制写成 CRLF。
+  sed -i 's/$/\r/' "$win_temp_dir/opencode.bat"
 
   # 4. 打包
   echo "📦 打包为: $final_filename"
@@ -206,6 +274,7 @@ EOF
 
   echo "✅ Windows 版本构建完成"
 }
+
 
 # ======================================
 # 🚀 主逻辑层
