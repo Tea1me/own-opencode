@@ -50,7 +50,33 @@ if [[ "$(bun --version)" != "1.3.14" ]]; then
   exit 1
 fi
 
-# 2) Source-mode OpenCode imports @opencode-ai/core at runtime, but upstream
+# 2) Windows TUI transport workaround.
+# Upstream v1.19.0 defaults to an in-process Worker RPC transport when no
+# --port/--hostname is supplied. On Windows that path can hang indefinitely
+# before the first TUI frame is rendered. The explicit-port path uses the
+# worker-hosted real HTTP server and is known to avoid the deadlock.
+#
+# For this Windows-only portable build, force the same external HTTP path while
+# keeping the normal default port value (0), so the OS still chooses a free
+# ephemeral port and users do not need a fixed port or launcher argument hack.
+(
+  cd "$WORK_DIR"
+  python3 - <<'PY'
+from pathlib import Path
+
+p = Path("packages/opencode/src/cli/cmd/tui.ts")
+text = p.read_text(encoding="utf-8")
+old = 'const external = hasArg("--port") || hasArg("--hostname") || network.mdns === true'
+new = 'const external = process.platform === "win32" || hasArg("--port") || hasArg("--hostname") || network.mdns === true'
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f"expected exactly one TUI transport expression, found {count}")
+p.write_text(text.replace(old, new), encoding="utf-8")
+print("[ok] patched Windows TUI to use external HTTP transport")
+PY
+)
+
+# 3) Source-mode OpenCode imports @opencode-ai/core at runtime, but upstream
 # v1.19.0 classifies it as a devDependency. Promote ONLY that workspace package
 # into runtime dependencies in the temporary staging checkout, then install the
 # production graph. This avoids the unrelated opencode devDependencies while
@@ -100,7 +126,7 @@ if [[ -z "$CORE_PKG" ]]; then
 fi
 echo "[ok] core runtime dependency: $CORE_PKG"
 
-# 3) Materialize workspace links so extraction on Windows does not require
+# 4) Materialize workspace links so extraction on Windows does not require
 # Developer Mode / symlink privileges. Handle both package-directory links and
 # .bin file links.
 WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
@@ -138,7 +164,7 @@ if [[ -z "$CORE_VERSION_FILE" ]]; then
   exit 1
 fi
 
-# 4) Bundle the exact Bun version expected by OpenCode v1.19.x.
+# 5) Bundle the exact Bun version expected by OpenCode v1.19.x.
 fetch "$BUN_URL" "$WORK_DIR/bun.zip"
 unzip -q "$WORK_DIR/bun.zip" -d "$WORK_DIR/runtime/bun"
 rm -f "$WORK_DIR/bun.zip"
@@ -152,7 +178,7 @@ if [[ ! -f "$WORK_DIR/runtime/bun/bun.exe" ]]; then
   mv "$bun_exe" "$WORK_DIR/runtime/bun/bun.exe"
 fi
 
-# 5) Strict launcher: portable runtime must neither auto-install missing imports
+# 6) Strict launcher: portable runtime must neither auto-install missing imports
 # nor self-update behind the user's back. Releases are controlled by this repo.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
@@ -170,7 +196,7 @@ exit /b %ERRORLEVEL%
 BAT
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
-# 6) Prune the source checkout aggressively. Runtime resolution only needs:
+# 7) Prune the source checkout aggressively. Runtime resolution only needs:
 # - packages/opencode (entrypoint + its assets/tsconfig/package.json)
 # - node_modules (installed graph, including materialized workspace packages)
 # - runtime/bun + launcher
@@ -182,9 +208,10 @@ find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
   ! -name opencode.bat \
   -exec rm -rf {} +
 
-# 7) Build-time assertions + size diagnostics.
+# 8) Build-time assertions + size diagnostics.
 grep -q -- '--no-install' "$WORK_DIR/opencode.bat"
 grep -q -- 'OPENCODE_DISABLE_AUTOUPDATE=1' "$WORK_DIR/opencode.bat"
+grep -q -- 'process.platform === "win32"' "$WORK_DIR/packages/opencode/src/cli/cmd/tui.ts"
 test -f "$WORK_DIR/runtime/bun/bun.exe"
 test -f "$WORK_DIR/packages/opencode/src/index.ts"
 test -n "$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit)"
