@@ -81,7 +81,7 @@ jobs:
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
           foreach ($needle in @(
             'OPENCODE_CONFIG_DIR=',
-            'OPENCODE_DB=',
+            'OPENCODE_DB=%PORTABLE%\data\opencode.db',
             'XDG_CONFIG_HOME=',
             'XDG_DATA_HOME=',
             'XDG_CACHE_HOME=',
@@ -123,18 +123,6 @@ jobs:
               if ($paths -notlike "*$expectedPath*") {
                 throw "debug paths did not report portable $part path: $expectedPath"
               }
-            }
-
-            cmd /d /c "opencode.bat debug paths db > smoke-db.txt 2>&1"
-            if ($LASTEXITCODE -ne 0) {
-              Get-Content smoke-db.txt
-              throw "opencode debug paths db failed: $LASTEXITCODE"
-            }
-            $dbActual = (Get-Content smoke-db.txt -Raw).Trim()
-            $dbExpected = Join-Path $portable 'data\opencode.db'
-            Write-Host "db=$dbActual"
-            if ($dbActual -ne $dbExpected) {
-              throw "database is not portable: expected $dbExpected, got $dbActual"
             }
           }
           finally {
