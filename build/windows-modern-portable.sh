@@ -45,41 +45,57 @@ if ! command -v bun >/dev/null 2>&1; then
   echo "CI build requires Bun 1.3.14" >&2
   exit 1
 fi
-
 if [[ "$(bun --version)" != "1.3.14" ]]; then
   echo "expected build Bun 1.3.14, got $(bun --version)" >&2
   exit 1
 fi
 
-# 2) Resolve the source-runtime workspace graph for Windows x64 at build time.
-# IMPORTANT: do not use --production here. OpenCode v1.19.0's TypeScript entrypoint
-# imports @opencode-ai/core at runtime even though upstream lists core in
-# devDependencies. A source-based portable build therefore needs selected dev
-# workspace dependencies preinstalled, otherwise Bun will try to auto-install
-# them on the user's machine.
+# 2) Install exactly the source workspace OpenCode itself filters in v1.19.0's
+# Nix build. Do NOT use --production: src/index.ts imports @opencode-ai/core at
+# runtime although upstream lists it in devDependencies.
 (
   cd "$WORK_DIR"
   bun install \
     --frozen-lockfile \
-    --filter '{./packages/opencode}...' \
+    --filter '!./' \
+    --filter './packages/opencode' \
     --os=win32 \
     --cpu=x64 \
     --backend=copyfile \
     --linker=hoisted \
-    --ignore-scripts
+    --ignore-scripts \
+    --no-progress
 )
 
-if [[ ! -e "$WORK_DIR/node_modules/@opencode-ai/core/package.json" ]]; then
+echo "[debug] node_modules roots after install:"
+find "$WORK_DIR" -type d -name node_modules -print | head -80 || true
+
+echo "[debug] @opencode-ai workspace links/packages:"
+find "$WORK_DIR" -path '*/node_modules/@opencode-ai/*' -maxdepth 8 -print 2>/dev/null | head -100 || true
+
+CORE_PKG=""
+for candidate in \
+  "$WORK_DIR/packages/opencode/node_modules/@opencode-ai/core/package.json" \
+  "$WORK_DIR/node_modules/@opencode-ai/core/package.json"; do
+  if [[ -e "$candidate" ]]; then
+    CORE_PKG="$candidate"
+    break
+  fi
+done
+if [[ -z "$CORE_PKG" ]]; then
+  CORE_PKG="$(find -L "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/package.json' -print -quit 2>/dev/null || true)"
+fi
+if [[ -z "$CORE_PKG" ]]; then
   echo "source runtime dependency @opencode-ai/core was not installed" >&2
-  echo "@opencode-ai entries:" >&2
-  find "$WORK_DIR/node_modules/@opencode-ai" -maxdepth 2 -print 2>/dev/null || true
   exit 1
 fi
+echo "[ok] core runtime dependency: $CORE_PKG"
 
-# 3) Bun may link workspace:* packages back into packages/. Those links are not
-# portable across extraction, so materialize only links that resolve inside this
-# source tree. Leave ordinary npm package links untouched.
+# 3) Workspace dependencies are symlinks to packages/* on Linux. Windows archive
+# extraction should not depend on symlink privileges, so materialize every
+# workspace link wherever Bun installed it. Ordinary npm links remain untouched.
 WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
+materialized=0
 while IFS= read -r -d '' link; do
   target="$(readlink -f "$link" 2>/dev/null || true)"
   case "$target" in
@@ -88,15 +104,21 @@ while IFS= read -r -d '' link; do
       rm -rf "$tmp_copy"
       mkdir -p "$tmp_copy"
       cp -a "$target"/. "$tmp_copy"/
+      # Resolution should use the installed/hoisted graph, not source-workspace
+      # node_modules symlinks copied from a different location.
       rm -rf "$tmp_copy/node_modules"
       rm -f "$link"
       mv "$tmp_copy" "$link"
+      materialized=$((materialized + 1))
       ;;
   esac
-done < <(find "$WORK_DIR/node_modules" -type l -print0)
+done < <(find "$WORK_DIR" -type l -path '*/node_modules/*' -print0)
+echo "[ok] materialized workspace links: $materialized"
 
-if [[ -L "$WORK_DIR/node_modules/@opencode-ai/core" ]]; then
-  echo "workspace materialization failed for @opencode-ai/core" >&2
+# Re-resolve core after materialization and ensure its source exists.
+CORE_VERSION_FILE="$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit 2>/dev/null || true)"
+if [[ -z "$CORE_VERSION_FILE" ]]; then
+  echo "materialized core workspace is incomplete" >&2
   exit 1
 fi
 
@@ -114,7 +136,7 @@ if [[ ! -f "$WORK_DIR/runtime/bun/bun.exe" ]]; then
   mv "$bun_exe" "$WORK_DIR/runtime/bun/bun.exe"
 fi
 
-# 5) Strict launcher: no hidden runtime dependency installation.
+# 5) Strict launcher: a portable runtime must never install missing imports.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
 setlocal EnableExtensions
@@ -128,18 +150,11 @@ for /f "delims=" %%b in ('"runtime\bun\bun.exe" --version') do echo [INFO] Bun %
 "runtime\bun\bun.exe" --no-install "%OPENCODE_ENTRYPOINT%" %*
 exit /b %ERRORLEVEL%
 BAT
-# cmd.exe is happiest with CRLF.
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
 # 6) Build-time assertions for the portable contract.
-if ! grep -q -- '--no-install' "$WORK_DIR/opencode.bat"; then
-  echo "launcher does not disable Bun auto-install" >&2
-  exit 1
-fi
-if [[ ! -f "$WORK_DIR/node_modules/@opencode-ai/core/src/installation/version.ts" ]]; then
-  echo "materialized core workspace is incomplete" >&2
-  exit 1
-fi
+grep -q -- '--no-install' "$WORK_DIR/opencode.bat"
+test -f "$WORK_DIR/runtime/bun/bun.exe"
 
 rm -f "$DIST_DIR/$OUT"
 tar -czf "$DIST_DIR/$OUT" -C "$ROOT_DIR/tmp" windows-modern
