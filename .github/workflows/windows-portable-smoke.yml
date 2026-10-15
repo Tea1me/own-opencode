@@ -6,6 +6,7 @@ on:
     paths:
       - 'build/windows-modern-portable.sh'
       - '.github/workflows/windows-portable-smoke.yml'
+      - '.github/workflows/auto-build.yml'
   workflow_dispatch:
 
 permissions:
