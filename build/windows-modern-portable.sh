@@ -50,14 +50,14 @@ if [[ "$(bun --version)" != "1.3.14" ]]; then
   exit 1
 fi
 
-# 2) Install exactly the source workspace OpenCode itself filters in v1.19.0's
-# Nix build. Do NOT use --production: src/index.ts imports @opencode-ai/core at
-# runtime although upstream lists it in devDependencies.
+# 2) Install ONLY the opencode workspace graph. Do NOT use --production:
+# src/index.ts imports @opencode-ai/core at runtime although upstream lists core
+# in devDependencies. The previous '!./' filter pulled almost the whole monorepo
+# (Electron/Playwright/Storybook/etc.) and produced an 883 MB artifact.
 (
   cd "$WORK_DIR"
   bun install \
     --frozen-lockfile \
-    --filter '!./' \
     --filter './packages/opencode' \
     --os=win32 \
     --cpu=x64 \
@@ -66,12 +66,6 @@ fi
     --ignore-scripts \
     --no-progress
 )
-
-echo "[debug] node_modules roots after install:"
-find "$WORK_DIR" -type d -name node_modules -print | head -80 || true
-
-echo "[debug] @opencode-ai workspace links/packages:"
-find "$WORK_DIR" -path '*/node_modules/@opencode-ai/*' -maxdepth 8 -print 2>/dev/null | head -100 || true
 
 CORE_PKG=""
 for candidate in \
@@ -91,11 +85,9 @@ if [[ -z "$CORE_PKG" ]]; then
 fi
 echo "[ok] core runtime dependency: $CORE_PKG"
 
-# 3) Workspace dependencies are symlinks to packages/* on Linux. Windows archive
-# extraction should not depend on symlink privileges, so materialize every
-# workspace link wherever Bun installed it. Ordinary npm links remain untouched.
-# Some node_modules/.bin entries point to workspace FILES rather than directories,
-# so handle both kinds explicitly.
+# 3) Materialize workspace links so extraction on Windows does not require
+# Developer Mode / symlink privileges. Handle both package-directory links and
+# .bin file links.
 WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
 materialized_dirs=0
 materialized_files=0
@@ -108,8 +100,6 @@ while IFS= read -r -d '' link; do
         rm -rf "$tmp_copy"
         mkdir -p "$tmp_copy"
         cp -a "$target"/. "$tmp_copy"/
-        # Resolution should use the installed/hoisted graph, not source-workspace
-        # node_modules symlinks copied from a different location.
         rm -rf "$tmp_copy/node_modules"
         rm -f "$link"
         mv "$tmp_copy" "$link"
@@ -127,14 +117,13 @@ while IFS= read -r -d '' link; do
 done < <(find "$WORK_DIR" -type l -path '*/node_modules/*' -print0)
 echo "[ok] materialized workspace links: dirs=$materialized_dirs files=$materialized_files"
 
-# Re-resolve core after materialization and ensure its source exists.
 CORE_VERSION_FILE="$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit 2>/dev/null || true)"
 if [[ -z "$CORE_VERSION_FILE" ]]; then
   echo "materialized core workspace is incomplete" >&2
   exit 1
 fi
 
-# 4) Bundle the same Bun version OpenCode v1.19.x expects.
+# 4) Bundle the exact Bun version expected by OpenCode v1.19.x.
 fetch "$BUN_URL" "$WORK_DIR/bun.zip"
 unzip -q "$WORK_DIR/bun.zip" -d "$WORK_DIR/runtime/bun"
 rm -f "$WORK_DIR/bun.zip"
@@ -148,7 +137,7 @@ if [[ ! -f "$WORK_DIR/runtime/bun/bun.exe" ]]; then
   mv "$bun_exe" "$WORK_DIR/runtime/bun/bun.exe"
 fi
 
-# 5) Strict launcher: a portable runtime must never install missing imports.
+# 5) Strict launcher: a portable runtime must never auto-install missing imports.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
 setlocal EnableExtensions
@@ -164,11 +153,32 @@ exit /b %ERRORLEVEL%
 BAT
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
-# 6) Build-time assertions for the portable contract.
+# 6) Prune the source checkout aggressively. Runtime resolution only needs:
+# - packages/opencode (entrypoint + its assets/tsconfig/package.json)
+# - node_modules (installed graph, including materialized workspace packages)
+# - runtime/bun + launcher
+# Everything else was build/repo material and caused huge archives.
+find "$WORK_DIR/packages" -mindepth 1 -maxdepth 1 ! -name opencode -exec rm -rf {} +
+find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
+  ! -name packages \
+  ! -name node_modules \
+  ! -name runtime \
+  ! -name opencode.bat \
+  -exec rm -rf {} +
+
+# 7) Build-time assertions + size diagnostics.
 grep -q -- '--no-install' "$WORK_DIR/opencode.bat"
 test -f "$WORK_DIR/runtime/bun/bun.exe"
+test -f "$WORK_DIR/packages/opencode/src/index.ts"
+test -n "$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit)"
+
+echo "[size] portable staging tree:"
+du -sh "$WORK_DIR"
+echo "[size] largest top-level runtime entries:"
+du -sh "$WORK_DIR"/* 2>/dev/null | sort -h | tail -20
 
 rm -f "$DIST_DIR/$OUT"
 tar -czf "$DIST_DIR/$OUT" -C "$ROOT_DIR/tmp" windows-modern
+ls -lh "$DIST_DIR/$OUT"
 sha256sum "$DIST_DIR/$OUT"
 echo "built: $DIST_DIR/$OUT"
