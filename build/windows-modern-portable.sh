@@ -51,6 +51,10 @@ if [[ -z "$OFFICIAL_EXE" || ! -f "$OFFICIAL_EXE" ]]; then
   exit 1
 fi
 cp "$OFFICIAL_EXE" "$WORK_DIR/bin/opencode.exe"
+if [[ ! -s "$WORK_DIR/bin/opencode.exe" ]]; then
+  echo "copied opencode.exe is empty" >&2
+  exit 1
+fi
 
 # Keep the executable below bin/ so adding the portable root to PATH resolves
 # `opencode` to opencode.bat instead of bypassing the portable environment via
@@ -85,8 +89,9 @@ exit /b %ERRORLEVEL%
 BAT
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
-# Build assertions.
-test -f "$WORK_DIR/bin/opencode.exe"
+# Build assertions that are valid on the Linux Actions builder. Runtime/version
+# verification happens later on windows-latest before any release is allowed.
+test -s "$WORK_DIR/bin/opencode.exe"
 grep -q -- 'OPENCODE_CONFIG_DIR=' "$WORK_DIR/opencode.bat"
 grep -q -- 'OPENCODE_DB=' "$WORK_DIR/opencode.bat"
 grep -q -- 'XDG_DATA_HOME=' "$WORK_DIR/opencode.bat"
@@ -99,15 +104,7 @@ for dir in config data cache state tmp; do
   printf 'portable runtime directory\n' > "$WORK_DIR/portable-data/$dir/.keep"
 done
 
-# Verify the downloaded executable matches the requested tag before packing.
-EXPECTED="${VERSION#v}"
-ACTUAL="$("$WORK_DIR/bin/opencode.exe" --version 2>/dev/null | tr -d '\r\n')"
-if [[ "$ACTUAL" != "$EXPECTED" ]]; then
-  echo "version mismatch: requested $EXPECTED, official executable reports $ACTUAL" >&2
-  exit 1
-fi
-echo "[ok] official OpenCode $ACTUAL"
-
+echo "[ok] staged official Windows CLI for $VERSION"
 echo "[size] staging tree:"
 du -sh "$WORK_DIR"
 du -sh "$WORK_DIR"/* 2>/dev/null | sort -h
