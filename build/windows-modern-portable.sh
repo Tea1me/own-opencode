@@ -152,12 +152,14 @@ if [[ ! -f "$WORK_DIR/runtime/bun/bun.exe" ]]; then
   mv "$bun_exe" "$WORK_DIR/runtime/bun/bun.exe"
 fi
 
-# 5) Strict launcher: a portable runtime must never auto-install missing imports.
+# 5) Strict launcher: portable runtime must neither auto-install missing imports
+# nor self-update behind the user's back. Releases are controlled by this repo.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
 set "OPENCODE_ENTRYPOINT=packages\opencode\src\index.ts"
+set "OPENCODE_DISABLE_AUTOUPDATE=1"
 if not exist "runtime\bun\bun.exe" (
   echo [ERROR] Bun runtime not found!
   exit /b 1
@@ -182,6 +184,7 @@ find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
 
 # 7) Build-time assertions + size diagnostics.
 grep -q -- '--no-install' "$WORK_DIR/opencode.bat"
+grep -q -- 'OPENCODE_DISABLE_AUTOUPDATE=1' "$WORK_DIR/opencode.bat"
 test -f "$WORK_DIR/runtime/bun/bun.exe"
 test -f "$WORK_DIR/packages/opencode/src/index.ts"
 test -n "$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit)"
