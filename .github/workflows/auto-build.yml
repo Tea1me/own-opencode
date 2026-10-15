@@ -1,4 +1,5 @@
 name: Auto Build & Release
+
 on:
   workflow_dispatch:
   schedule:
@@ -15,15 +16,22 @@ jobs:
     steps:
       - name: 获取官方最新版本
         id: get-tag
+        shell: bash
         run: |
+          set -euo pipefail
+          TAG=""
           for i in {1..3}; do
-            TAG=$(curl -s --retry 3 https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name')
+            TAG=$(curl -fsSL --retry 3 https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name')
             if [ "$TAG" != "null" ] && [ -n "$TAG" ]; then
               break
             fi
             sleep 5
           done
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "❌ 无法获取官方最新版本" >&2
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
           echo "✅ 官方最新版本: $TAG"
 
   build:
@@ -48,9 +56,6 @@ jobs:
           - os: windows
             arch: x64
             type: modern
-          - os: windows
-            arch: x64
-            type: legacy
 
     steps:
       - name: 检出代码
@@ -61,27 +66,89 @@ jobs:
           fetch-depth: 1
 
       - name: 安装依赖
-        run: sudo apt update && sudo apt install -y wget jq unzip
-        
-      - name: 安装 Bun（仅用于 Windows 源码依赖预装）
-        if: matrix.os == 'windows'
+        run: sudo apt-get update && sudo apt-get install -y wget jq unzip
+
+      - name: 安装 Bun 1.3.14（Windows modern 构建）
+        if: matrix.os == 'windows' && matrix.type == 'modern'
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       - name: 构建
+        shell: bash
         run: |
-          chmod +x build/build.sh
-          ./build/build.sh ${{ needs.get-version.outputs.tag }} ${{ matrix.arch }} ${{ matrix.type }}
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows" ] && [ "${{ matrix.type }}" = "modern" ]; then
+            chmod +x build/windows-modern-portable.sh
+            ./build/windows-modern-portable.sh '${{ needs.get-version.outputs.tag }}'
+          else
+            chmod +x build/build.sh
+            ./build/build.sh '${{ needs.get-version.outputs.tag }}' '${{ matrix.arch }}' '${{ matrix.type }}'
+          fi
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-${{ matrix.type }}-${{ matrix.arch }}
           path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  validate-windows-modern:
+    needs: [get-version, build]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: 下载 Windows modern 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-modern-x64
+          path: artifact
+
+      - name: 解压并验证 portable 契约
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem artifact -Filter *.tar.gz | Select-Object -First 1
+          if (-not $archive) { throw 'windows modern artifact missing' }
+          New-Item -ItemType Directory -Force -Path unpacked | Out-Null
+          tar -xzf $archive.FullName -C unpacked
+
+          $root = Resolve-Path 'unpacked/windows-modern'
+          $bun = Join-Path $root 'runtime/bun/bun.exe'
+          if (-not (Test-Path $bun)) { throw 'bundled bun.exe missing' }
+
+          $v = & $bun --version
+          if ($LASTEXITCODE -ne 0) { throw 'bun --version failed' }
+          if ($v.Trim() -ne '1.3.14') { throw "expected Bun 1.3.14, got $v" }
+
+          $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
+          if ($bat -notmatch '--no-install') { throw 'launcher must disable Bun auto-install' }
+          if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher must disable OpenCode auto-update' }
+
+      - name: Windows 真机 smoke
+        shell: pwsh
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: '1'
+        run: |
+          $root = Resolve-Path 'unpacked/windows-modern'
+          Push-Location $root
+          try {
+            cmd /d /c "opencode.bat --version"
+            if ($LASTEXITCODE -ne 0) { throw "opencode --version failed: $LASTEXITCODE" }
+
+            cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-help.txt
+              throw "opencode --help failed: $LASTEXITCODE"
+            }
+            Get-Content smoke-help.txt | Select-Object -First 80
+          }
+          finally {
+            Pop-Location
+          }
 
   release:
-    needs: [get-version, build]
+    needs: [get-version, build, validate-windows-modern]
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -108,9 +175,11 @@ jobs:
           body: |
             🚀 便携版
             - Linux x64/arm64 (glibc/musl)
-            - Windows x64 (Bun / Node.js)
+            - Windows x64 modern (Windows 10+, Bun 1.3.14)
+            - Windows modern 包发布前会在 windows-latest 上执行真实启动 smoke test
+            - 运行时禁止 Bun 自动补包，并关闭 OpenCode 自更新
           files: dist/*.tar.gz
-          overwrite_files: true  # ✅ 强制覆盖旧文件，**杜绝重复**
+          overwrite_files: true
           draft: false
           prerelease: false
         env:
