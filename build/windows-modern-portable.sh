@@ -51,13 +51,16 @@ if [[ "$(bun --version)" != "1.3.14" ]]; then
   exit 1
 fi
 
-# 2) Resolve the complete production workspace graph for Windows x64 at build time.
-# Runtime is deliberately forbidden from auto-installing missing imports.
+# 2) Resolve the source-runtime workspace graph for Windows x64 at build time.
+# IMPORTANT: do not use --production here. OpenCode v1.19.0's TypeScript entrypoint
+# imports @opencode-ai/core at runtime even though upstream lists core in
+# devDependencies. A source-based portable build therefore needs selected dev
+# workspace dependencies preinstalled, otherwise Bun will try to auto-install
+# them on the user's machine.
 (
   cd "$WORK_DIR"
   bun install \
     --frozen-lockfile \
-    --production \
     --filter '{./packages/opencode}...' \
     --os=win32 \
     --cpu=x64 \
@@ -67,7 +70,9 @@ fi
 )
 
 if [[ ! -e "$WORK_DIR/node_modules/@opencode-ai/core/package.json" ]]; then
-  echo "workspace dependency @opencode-ai/core was not installed" >&2
+  echo "source runtime dependency @opencode-ai/core was not installed" >&2
+  echo "@opencode-ai entries:" >&2
+  find "$WORK_DIR/node_modules/@opencode-ai" -maxdepth 2 -print 2>/dev/null || true
   exit 1
 fi
 
