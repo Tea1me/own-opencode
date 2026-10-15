@@ -187,26 +187,39 @@ build_windows() {
     exit 1
   fi
 
-  # Bun 对 workspace:* 通常创建 symlink 指向 packages/*。
-  # 为避免 Windows 解压 tar.gz 时 symlink 丢失/权限失败，只把“指向当前源码树内部”的
-  # node_modules symlink 实体化为真实目录。外部 npm 包已经由 copyfile 安装。
+  # Bun 对 workspace:* 会创建 symlink 指向 packages/*。
+  # Linux CI 里的 readlink -f 返回绝对路径，因此这里先把 portable 根目录也规范成绝对路径。
+  # 只处理根 node_modules 中指回当前源码树 packages/* 的 workspace 链接；
+  # 普通 npm 包/普通 symlink 一律不碰。
   echo "📦 实体化内部 workspace 链接（Windows portable）"
+  local win_temp_abs
+  win_temp_abs="$(cd "$win_temp_dir" && pwd -P)"
+
   while IFS= read -r -d '' link; do
     target="$(readlink -f "$link" 2>/dev/null || true)"
     case "$target" in
-      "$win_temp_dir"/packages/*)
-        echo "  materialize: ${link#$win_temp_dir/} -> ${target#$win_temp_dir/}"
+      "$win_temp_abs"/packages/*)
+        echo "  materialize: ${link#$win_temp_dir/} -> ${target#$win_temp_abs/}"
+
         tmp_copy="${link}.portable-copy"
         rm -rf "$tmp_copy"
-        cp -aL "$link" "$tmp_copy"
+        mkdir -p "$tmp_copy"
+
+        # 复制 workspace 源码本体，不继承 workspace 自己可能生成的 node_modules 链接。
+        cp -a "$target"/. "$tmp_copy"/
+        rm -rf "$tmp_copy/node_modules"
+
         rm -f "$link"
         mv "$tmp_copy" "$link"
         ;;
     esac
-  done < <(find "$win_temp_dir" -path '*/node_modules/*' -type l -print0)
+  done < <(find "$win_temp_dir/node_modules" -type l -print0)
 
   if [ -L "$win_temp_dir/node_modules/@opencode-ai/core" ]; then
     echo "❌ @opencode-ai/core 仍然是 symlink，portable 实体化失败"
+    echo "   link: $(readlink "$win_temp_dir/node_modules/@opencode-ai/core" 2>/dev/null || true)"
+    echo "   resolved: $(readlink -f "$win_temp_dir/node_modules/@opencode-ai/core" 2>/dev/null || true)"
+    echo "   root: $win_temp_abs"
     exit 1
   fi
 
