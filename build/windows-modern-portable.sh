@@ -94,26 +94,38 @@ echo "[ok] core runtime dependency: $CORE_PKG"
 # 3) Workspace dependencies are symlinks to packages/* on Linux. Windows archive
 # extraction should not depend on symlink privileges, so materialize every
 # workspace link wherever Bun installed it. Ordinary npm links remain untouched.
+# Some node_modules/.bin entries point to workspace FILES rather than directories,
+# so handle both kinds explicitly.
 WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
-materialized=0
+materialized_dirs=0
+materialized_files=0
 while IFS= read -r -d '' link; do
   target="$(readlink -f "$link" 2>/dev/null || true)"
   case "$target" in
     "$WORK_ABS"/packages/*)
-      tmp_copy="${link}.portable-copy"
-      rm -rf "$tmp_copy"
-      mkdir -p "$tmp_copy"
-      cp -a "$target"/. "$tmp_copy"/
-      # Resolution should use the installed/hoisted graph, not source-workspace
-      # node_modules symlinks copied from a different location.
-      rm -rf "$tmp_copy/node_modules"
-      rm -f "$link"
-      mv "$tmp_copy" "$link"
-      materialized=$((materialized + 1))
+      if [[ -d "$target" ]]; then
+        tmp_copy="${link}.portable-copy"
+        rm -rf "$tmp_copy"
+        mkdir -p "$tmp_copy"
+        cp -a "$target"/. "$tmp_copy"/
+        # Resolution should use the installed/hoisted graph, not source-workspace
+        # node_modules symlinks copied from a different location.
+        rm -rf "$tmp_copy/node_modules"
+        rm -f "$link"
+        mv "$tmp_copy" "$link"
+        materialized_dirs=$((materialized_dirs + 1))
+      elif [[ -f "$target" ]]; then
+        rm -f "$link"
+        cp -a "$target" "$link"
+        materialized_files=$((materialized_files + 1))
+      else
+        echo "unsupported workspace symlink target: $link -> $target" >&2
+        exit 1
+      fi
       ;;
   esac
 done < <(find "$WORK_DIR" -type l -path '*/node_modules/*' -print0)
-echo "[ok] materialized workspace links: $materialized"
+echo "[ok] materialized workspace links: dirs=$materialized_dirs files=$materialized_files"
 
 # Re-resolve core after materialization and ensure its source exists.
 CORE_VERSION_FILE="$(find "$WORK_DIR" -path '*/node_modules/@opencode-ai/core/src/installation/version.ts' -print -quit 2>/dev/null || true)"
