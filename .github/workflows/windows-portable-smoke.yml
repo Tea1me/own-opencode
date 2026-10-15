@@ -33,12 +33,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Using OpenCode $tag"
 
-      - name: Setup Bun 1.3.14
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Build Windows modern portable
+      - name: Build Windows compiled portable
         shell: bash
         run: |
           chmod +x build/windows-modern-portable.sh
@@ -63,7 +58,7 @@ jobs:
           name: windows-modern-smoke
           path: artifact
 
-      - name: Extract portable
+      - name: Extract
         shell: pwsh
         run: |
           $archive = Get-ChildItem artifact -Filter *.tar.gz | Select-Object -First 1
@@ -71,52 +66,80 @@ jobs:
           New-Item -ItemType Directory -Force -Path unpacked | Out-Null
           tar -xzf $archive.FullName -C unpacked
 
-      - name: Verify bundled runtime and CLI commands
+      - name: Verify compiled engine and portable launcher
         shell: pwsh
-        env:
-          OPENCODE_DISABLE_AUTOUPDATE: '1'
         run: |
           $root = Resolve-Path 'unpacked/windows-modern'
-          $bun = Join-Path $root 'runtime/bun/bun.exe'
-          if (-not (Test-Path $bun)) { throw 'bundled bun.exe missing' }
-          $v = & $bun --version
-          if ($LASTEXITCODE -ne 0) { throw 'bun --version failed' }
-          if ($v.Trim() -ne '1.3.14') { throw "expected Bun 1.3.14, got $v" }
+          $exe = Join-Path $root 'bin/opencode.exe'
+          if (-not (Test-Path $exe)) { throw 'bin/opencode.exe missing' }
+
+          $expected = '${{ needs.build.outputs.tag }}'.TrimStart('v')
+          $actual = (& $exe --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'compiled opencode --version failed' }
+          if ($actual -ne $expected) { throw "expected $expected, got $actual" }
+
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
-          if ($bat -notmatch '--no-install') { throw 'launcher does not contain --no-install' }
-          if ($bat -notmatch 'OPENCODE_DISABLE_AUTOUPDATE=1') { throw 'launcher does not disable OpenCode auto-update' }
+          foreach ($needle in @(
+            'OPENCODE_CONFIG_DIR=',
+            'OPENCODE_DB=',
+            'XDG_CONFIG_HOME=',
+            'XDG_DATA_HOME=',
+            'XDG_CACHE_HOME=',
+            'XDG_STATE_HOME=',
+            'OPENCODE_DISABLE_AUTOUPDATE=1',
+            'bin\opencode.exe'
+          )) {
+            if ($bat -notmatch [regex]::Escape($needle)) { throw "launcher missing: $needle" }
+          }
+
+      - name: Verify CLI and portable paths
+        shell: pwsh
+        run: |
+          $root = Resolve-Path 'unpacked/windows-modern'
           Push-Location $root
           try {
             cmd /d /c "opencode.bat --version"
-            if ($LASTEXITCODE -ne 0) { throw "opencode --version failed with $LASTEXITCODE" }
-            cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
-            if ($LASTEXITCODE -ne 0) { Get-Content smoke-help.txt; throw "opencode --help failed" }
-          } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "opencode --version failed: $LASTEXITCODE" }
 
-      - name: Download official Windows CLI for control test
-        shell: pwsh
-        run: |
-          $tag = '${{ needs.build.outputs.tag }}'
-          $url = "https://github.com/anomalyco/opencode/releases/download/$tag/opencode-windows-x64.zip"
-          Write-Host "Downloading control: $url"
-          curl.exe -fL --retry 3 -o official.zip $url
-          New-Item -ItemType Directory -Force -Path official | Out-Null
-          Expand-Archive -Path official.zip -DestinationPath official -Force
-          Get-ChildItem official -Recurse | Select-Object FullName,Length
-          $exe = Get-ChildItem official -Recurse -Filter opencode.exe | Select-Object -First 1
-          if (-not $exe) { throw 'official opencode.exe missing' }
-          & $exe.FullName --version
-          if ($LASTEXITCODE -ne 0) { throw 'official --version failed' }
+            cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-help.txt
+              throw "opencode --help failed: $LASTEXITCODE"
+            }
+
+            cmd /d /c "opencode.bat debug paths > smoke-paths.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-paths.txt
+              throw "opencode debug paths failed: $LASTEXITCODE"
+            }
+            $paths = Get-Content smoke-paths.txt -Raw
+            Write-Host $paths
+
+            $portable = (Resolve-Path 'portable-data').Path
+            $expectedParts = @('config', 'data', 'cache', 'state')
+            foreach ($part in $expectedParts) {
+              $expectedPath = Join-Path $portable $part
+              if ($paths -notlike "*$expectedPath*") {
+                throw "debug paths did not report portable $part path: $expectedPath"
+              }
+            }
+            $db = Join-Path $portable 'data\opencode.db'
+            if ($paths -notlike "*$db*") {
+              throw "debug paths did not report portable database: $db"
+            }
+          }
+          finally {
+            Pop-Location
+          }
 
       - name: Install ConPTY test helper
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: Compare official and portable TUI in identical ConPTY
+      - name: Interactive TUI must render
         shell: pwsh
         env:
-          OPENCODE_DISABLE_AUTOUPDATE: '1'
-          OPENCODE_PURE: '1'
+          PYTHONIOENCODING: utf-8
         run: |
           @'
           import os
@@ -125,67 +148,49 @@ jobs:
           import time
           from winpty import PtyProcess
 
-          workspace = os.getcwd()
-          portable_root = os.path.abspath(r"unpacked\windows-modern")
-          portable_bat = os.path.join(portable_root, "opencode.bat")
+          root = os.path.abspath(r"unpacked\windows-modern")
+          bat = os.path.join(root, "opencode.bat")
+          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=root, dimensions=(120, 40))
+          chunks = []
 
-          official_candidates = []
-          for base, _, files in os.walk(os.path.abspath("official")):
-              for name in files:
-                  if name.lower() == "opencode.exe":
-                      official_candidates.append(os.path.join(base, name))
-          if not official_candidates:
-              raise SystemExit("official opencode.exe not found")
-          official_exe = official_candidates[0]
+          def reader():
+              try:
+                  while proc.isalive():
+                      data = proc.read(4096)
+                      if data:
+                          chunks.append(data)
+              except (EOFError, OSError):
+                  pass
 
-          def clean_text(output):
-              clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
-              clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
-              clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
-              clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
-              return clean.strip()
+          thread = threading.Thread(target=reader, daemon=True)
+          thread.start()
+          time.sleep(12)
+          alive = proc.isalive()
+          if alive:
+              try:
+                  proc.write("\x03")
+              except Exception:
+                  pass
+              time.sleep(1)
+          if proc.isalive():
+              proc.terminate(force=True)
+          thread.join(timeout=2)
 
-          def run_case(label, argv, cwd):
-              print(f"===== {label}: {argv!r} =====")
-              proc = PtyProcess.spawn(argv, cwd=cwd, dimensions=(120, 40))
-              chunks = []
-              def reader():
-                  try:
-                      while proc.isalive():
-                          data = proc.read(4096)
-                          if data:
-                              chunks.append(data)
-                  except (EOFError, OSError):
-                      pass
-              t = threading.Thread(target=reader, daemon=True)
-              t.start()
-              time.sleep(12)
-              alive = proc.isalive()
-              if alive:
-                  try:
-                      proc.write("\x03")
-                  except Exception:
-                      pass
-                  time.sleep(1)
-              if proc.isalive():
-                  proc.terminate(force=True)
-              t.join(timeout=2)
-              output = "".join(chunks)
-              text = clean_text(output)
-              print(f"----- {label} raw -----")
-              print(repr(output[:16000]))
-              print(f"----- {label} printable -----")
-              print(text[:12000])
-              print(f"RESULT {label}: printable={len(text)} alive_after_12s={alive}")
-              return output, text
+          output = "".join(chunks)
+          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+          clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
+          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
+          printable = clean.strip()
+          print(repr(output[:16000]))
+          print(printable[:12000])
+          print(f"printable chars={len(printable)} alive_after_12s={alive}")
 
-          portable = run_case("portable", ["cmd.exe", "/d", "/c", portable_bat], portable_root)
-          official = run_case("official", [official_exe], os.path.dirname(official_exe))
-
-          print(f"SUMMARY portable={len(portable[1])} official={len(official[1])}")
-          if len(official[1]) < 80:
-              raise SystemExit("official binary is also blank in CI ConPTY; ConPTY is not a valid render oracle")
-          if len(portable[1]) < 80:
-              raise SystemExit("official binary renders but portable TUI is blank")
-          '@ | Set-Content -Encoding UTF8 tui_control_compare.py
-          python tui_control_compare.py
+          lower = output.lower()
+          for marker in ("module not found", "cannot find module", "unexpected error", "syntaxerror", "referenceerror"):
+              if marker in lower:
+                  raise SystemExit(f"TUI emitted fatal marker: {marker}")
+          if len(printable) < 80:
+              raise SystemExit("interactive TUI did not render enough printable terminal content")
+          '@ | Set-Content -Encoding UTF8 tui_smoke.py
+          python tui_smoke.py
