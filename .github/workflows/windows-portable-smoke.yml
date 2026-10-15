@@ -86,6 +86,8 @@ jobs:
             'XDG_DATA_HOME=',
             'XDG_CACHE_HOME=',
             'XDG_STATE_HOME=',
+            'TEMP=%PORTABLE%',
+            'TMP=%PORTABLE%',
             'OPENCODE_DISABLE_AUTOUPDATE=1',
             'bin\opencode.exe'
           )) {
@@ -116,16 +118,23 @@ jobs:
             Write-Host $paths
 
             $portable = (Resolve-Path 'portable-data').Path
-            $expectedParts = @('config', 'data', 'cache', 'state')
-            foreach ($part in $expectedParts) {
+            foreach ($part in @('config', 'data', 'cache', 'state', 'tmp')) {
               $expectedPath = Join-Path $portable $part
               if ($paths -notlike "*$expectedPath*") {
                 throw "debug paths did not report portable $part path: $expectedPath"
               }
             }
-            $db = Join-Path $portable 'data\opencode.db'
-            if ($paths -notlike "*$db*") {
-              throw "debug paths did not report portable database: $db"
+
+            cmd /d /c "opencode.bat debug paths db > smoke-db.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-db.txt
+              throw "opencode debug paths db failed: $LASTEXITCODE"
+            }
+            $dbActual = (Get-Content smoke-db.txt -Raw).Trim()
+            $dbExpected = Join-Path $portable 'data\opencode.db'
+            Write-Host "db=$dbActual"
+            if ($dbActual -ne $dbExpected) {
+              throw "database is not portable: expected $dbExpected, got $dbActual"
             }
           }
           finally {
