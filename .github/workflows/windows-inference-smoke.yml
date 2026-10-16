@@ -1,0 +1,147 @@
+name: Windows Portable Inference Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'build/windows-modern-portable.sh'
+      - '.github/workflows/windows-inference-smoke.yml'
+      - '.github/workflows/windows-portable-smoke.yml'
+      - '.github/workflows/auto-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y wget jq unzip
+
+      - name: Resolve latest OpenCode release
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(curl -fsSL https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r .tag_name)
+          test -n "$tag" && test "$tag" != "null"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using OpenCode $tag"
+
+      - name: Build strict Windows portable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build/windows-modern-portable.sh
+          ./build/windows-modern-portable.sh '${{ steps.version.outputs.tag }}'
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-inference-smoke
+          path: dist/opencode-${{ steps.version.outputs.tag }}-portable-windows-modern-x64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  inference:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download portable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-inference-smoke
+          path: artifact
+
+      - name: Extract
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem artifact -Filter *.tar.gz | Select-Object -First 1
+          if (-not $archive) { throw 'portable archive missing' }
+          New-Item -ItemType Directory -Force -Path unpacked | Out-Null
+          tar -xzf $archive.FullName -C unpacked
+
+      - name: End-to-end default free-model inference
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path 'unpacked/windows-modern').Path
+          $bat = Join-Path $root 'opencode.bat'
+          $portable = Join-Path $root 'portable-data'
+          $configFile = Join-Path $portable 'config\opencode\opencode.jsonc'
+          $project = Join-Path $PWD 'inference-project'
+          New-Item -ItemType Directory -Force -Path $project | Out-Null
+
+          # Start from a clean anonymous/default-model state. Do not specify --model.
+          @'
+          {
+            "$schema": "https://opencode.ai/config.json"
+          }
+          '@ | Set-Content -Encoding UTF8 $configFile
+
+          # Prove that the anonymous OpenCode provider exposes at least one model.
+          Push-Location $project
+          try {
+            cmd /d /c "`"$bat`" models opencode > free-models.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content free-models.txt
+              throw "listing anonymous opencode models failed: $LASTEXITCODE"
+            }
+            $models = Get-Content free-models.txt | Where-Object { $_ -match '^opencode/' }
+            Write-Host 'Anonymous OpenCode models:'
+            $models | ForEach-Object { Write-Host "  $_" }
+            if (-not $models -or $models.Count -lt 1) {
+              throw 'no anonymous OpenCode model is available'
+            }
+
+            # Use a result that does not occur in the prompt so a mere echo cannot pass.
+            @"
+          @echo off
+          call "$bat" run "Compute 41837 + 57264. Reply with only the integer result." --format json
+          "@ | Set-Content -Encoding ASCII e2e.cmd
+
+            $stdout = Join-Path $project 'inference-stdout.txt'
+            $stderr = Join-Path $project 'inference-stderr.txt'
+            $proc = Start-Process -FilePath 'cmd.exe' `
+              -ArgumentList @('/d', '/c', 'e2e.cmd') `
+              -WorkingDirectory $project `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr `
+              -PassThru
+
+            if (-not $proc.WaitForExit(180000)) {
+              try { $proc.Kill($true) } catch {}
+              throw 'default-model inference timed out after 180 seconds'
+            }
+            $proc.WaitForExit()
+
+            $out = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { '' }
+            $err = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
+            Write-Host '--- inference stdout ---'
+            Write-Host $out
+            Write-Host '--- inference stderr ---'
+            Write-Host $err
+            Write-Host "exit=$($proc.ExitCode)"
+
+            if ($proc.ExitCode -ne 0) {
+              throw "default-model inference failed with exit code $($proc.ExitCode)"
+            }
+            if ($out -notmatch '99101') {
+              throw 'model did not return the expected inference result 99101'
+            }
+
+            $db = Join-Path $portable 'data\opencode\opencode.db'
+            if (-not (Test-Path $db)) {
+              throw "inference did not create the portable database: $db"
+            }
+          }
+          finally {
+            Pop-Location
+          }
