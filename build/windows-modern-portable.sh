@@ -22,11 +22,13 @@ trap cleanup EXIT
 rm -rf "$WORK_DIR" "$WORK_PARENT/windows-official"
 mkdir -p \
   "$WORK_DIR/bin" \
-  "$WORK_DIR/portable-data/config" \
-  "$WORK_DIR/portable-data/data" \
+  "$WORK_DIR/portable-data/config/opencode" \
+  "$WORK_DIR/portable-data/data/opencode" \
   "$WORK_DIR/portable-data/cache" \
   "$WORK_DIR/portable-data/state" \
   "$WORK_DIR/portable-data/tmp" \
+  "$WORK_DIR/portable-data/home/AppData/Roaming" \
+  "$WORK_DIR/portable-data/home/AppData/Local" \
   "$WORK_PARENT/windows-official" \
   "$DIST_DIR"
 
@@ -40,8 +42,7 @@ fetch() {
 # Use the exact upstream compiled Windows CLI for this OpenCode tag. The
 # official binary already contains Bun, OpenTUI's Solid transform, embedded
 # workers, build-time version/channel constants, and the platform-specific
-# native dependencies. Running the raw TypeScript source is NOT equivalent to
-# the official build and can leave the interactive TUI blank on Windows.
+# native dependencies.
 fetch "$UPSTREAM_ZIP_URL" "$WORK_PARENT/windows-official/opencode.zip"
 unzip -q "$WORK_PARENT/windows-official/opencode.zip" -d "$WORK_PARENT/windows-official/extracted"
 
@@ -56,36 +57,65 @@ if [[ ! -s "$WORK_DIR/bin/opencode.exe" ]]; then
   exit 1
 fi
 
+# Canonical package-local global config. OpenCode v1.19 writes global config
+# through Global.Path.config (= XDG_CONFIG_HOME/opencode), so keep
+# OPENCODE_CONFIG_DIR and XDG_CONFIG_HOME aligned to this exact directory.
+cat > "$WORK_DIR/portable-data/config/opencode/opencode.jsonc" <<'JSONC'
+{
+  "$schema": "https://opencode.ai/config.json"
+}
+JSONC
+
 # Keep the executable below bin/ so adding the portable root to PATH resolves
-# `opencode` to opencode.bat instead of bypassing the portable environment via
-# PATHEXT's .EXE-before-.BAT ordering.
+# `opencode` to opencode.bat. The launcher NEVER changes cwd: invoking it from a
+# project directory must keep that project as OpenCode's working directory.
 cat > "$WORK_DIR/opencode.bat" <<'BAT'
 @echo off
 setlocal EnableExtensions
-cd /d "%~dp0"
 
 set "ROOT=%~dp0"
 set "PORTABLE=%ROOT%portable-data"
+set "PORTABLE_HOME=%PORTABLE%\home"
+set "CONFIG_HOME=%PORTABLE%\config"
+set "CONFIG_DIR=%CONFIG_HOME%\opencode"
+set "DATA_HOME=%PORTABLE%\data"
+set "CACHE_HOME=%PORTABLE%\cache"
+set "STATE_HOME=%PORTABLE%\state"
+set "TMP_HOME=%PORTABLE%\tmp"
 
-if not exist "%PORTABLE%\config" mkdir "%PORTABLE%\config"
-if not exist "%PORTABLE%\data" mkdir "%PORTABLE%\data"
-if not exist "%PORTABLE%\cache" mkdir "%PORTABLE%\cache"
-if not exist "%PORTABLE%\state" mkdir "%PORTABLE%\state"
-if not exist "%PORTABLE%\tmp" mkdir "%PORTABLE%\tmp"
+if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%"
+if not exist "%DATA_HOME%\opencode" mkdir "%DATA_HOME%\opencode"
+if not exist "%CACHE_HOME%" mkdir "%CACHE_HOME%"
+if not exist "%STATE_HOME%" mkdir "%STATE_HOME%"
+if not exist "%TMP_HOME%" mkdir "%TMP_HOME%"
+if not exist "%PORTABLE_HOME%\AppData\Roaming" mkdir "%PORTABLE_HOME%\AppData\Roaming"
+if not exist "%PORTABLE_HOME%\AppData\Local" mkdir "%PORTABLE_HOME%\AppData\Local"
+if not exist "%CONFIG_DIR%\opencode.jsonc" (
+  >"%CONFIG_DIR%\opencode.jsonc" echo {
+  >>"%CONFIG_DIR%\opencode.jsonc" echo   "$schema": "https://opencode.ai/config.json"
+  >>"%CONFIG_DIR%\opencode.jsonc" echo }
+)
 
-rem Keep OpenCode's persistent state beside this launcher.
-set "OPENCODE_CONFIG_DIR=%PORTABLE%\config"
-set "OPENCODE_DB=%PORTABLE%\data\opencode.db"
-set "XDG_CONFIG_HOME=%PORTABLE%\config"
-set "XDG_DATA_HOME=%PORTABLE%\data"
-set "XDG_CACHE_HOME=%PORTABLE%\cache"
-set "XDG_STATE_HOME=%PORTABLE%\state"
+rem Strict portable home. This prevents libraries that ignore XDG variables
+rem from falling back to C:\Users\<user> for OpenCode-owned state.
+set "HOME=%PORTABLE_HOME%"
+set "USERPROFILE=%PORTABLE_HOME%"
+set "APPDATA=%PORTABLE_HOME%\AppData\Roaming"
+set "LOCALAPPDATA=%PORTABLE_HOME%\AppData\Local"
 
-rem Keep OpenCode/Bun temporary files portable too. HOME/USERPROFILE are left
-rem untouched intentionally so Git, SSH, and user shell configuration continue
-rem to work normally.
-set "TEMP=%PORTABLE%\tmp"
-set "TMP=%PORTABLE%\tmp"
+rem OpenCode/XDG paths. CONFIG_DIR intentionally equals XDG_CONFIG_HOME\opencode
+rem because v1.19 global config writes use Global.Path.config directly.
+set "XDG_CONFIG_HOME=%CONFIG_HOME%"
+set "XDG_DATA_HOME=%DATA_HOME%"
+set "XDG_CACHE_HOME=%CACHE_HOME%"
+set "XDG_STATE_HOME=%STATE_HOME%"
+set "XDG_RUNTIME_DIR=%TMP_HOME%"
+set "OPENCODE_CONFIG_DIR=%CONFIG_DIR%"
+set "OPENCODE_DB=%DATA_HOME%\opencode\opencode.db"
+
+rem Temporary files stay beside the application too.
+set "TEMP=%TMP_HOME%"
+set "TMP=%TMP_HOME%"
 
 rem Releases are controlled by this portable repository, not by self-update.
 set "OPENCODE_DISABLE_AUTOUPDATE=1"
@@ -95,24 +125,34 @@ exit /b %ERRORLEVEL%
 BAT
 sed -i 's/$/\r/' "$WORK_DIR/opencode.bat"
 
-# Build assertions that are valid on the Linux Actions builder. Runtime/version
-# verification happens later on windows-latest before any release is allowed.
+# Build assertions valid on the Linux Actions builder. Runtime verification is
+# performed on windows-latest before any release is allowed.
 test -s "$WORK_DIR/bin/opencode.exe"
-grep -q -- 'OPENCODE_CONFIG_DIR=' "$WORK_DIR/opencode.bat"
-grep -q -- 'OPENCODE_DB=' "$WORK_DIR/opencode.bat"
-grep -q -- 'XDG_DATA_HOME=' "$WORK_DIR/opencode.bat"
-grep -q -- 'XDG_CACHE_HOME=' "$WORK_DIR/opencode.bat"
-grep -q -- 'XDG_STATE_HOME=' "$WORK_DIR/opencode.bat"
-grep -q -- 'TEMP=%PORTABLE%' "$WORK_DIR/opencode.bat"
-grep -q -- 'TMP=%PORTABLE%' "$WORK_DIR/opencode.bat"
+test -f "$WORK_DIR/portable-data/config/opencode/opencode.jsonc"
+! grep -qi -- '^cd /d ' "$WORK_DIR/opencode.bat"
+grep -q -- 'HOME=%PORTABLE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'USERPROFILE=%PORTABLE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'APPDATA=%PORTABLE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'LOCALAPPDATA=%PORTABLE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'OPENCODE_CONFIG_DIR=%CONFIG_DIR%' "$WORK_DIR/opencode.bat"
+grep -q -- 'OPENCODE_DB=%DATA_HOME%\\opencode\\opencode.db' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_CONFIG_HOME=%CONFIG_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_DATA_HOME=%DATA_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_CACHE_HOME=%CACHE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_STATE_HOME=%STATE_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'XDG_RUNTIME_DIR=%TMP_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'TEMP=%TMP_HOME%' "$WORK_DIR/opencode.bat"
+grep -q -- 'TMP=%TMP_HOME%' "$WORK_DIR/opencode.bat"
 grep -q -- 'OPENCODE_DISABLE_AUTOUPDATE=1' "$WORK_DIR/opencode.bat"
 
-# Preserve empty portable directories in archives/tools that may drop empties.
-for dir in config data cache state tmp; do
+# Preserve otherwise-empty runtime directories in archives/tools that drop them.
+for dir in cache state tmp; do
   printf 'portable runtime directory\n' > "$WORK_DIR/portable-data/$dir/.keep"
 done
+printf 'portable runtime directory\n' > "$WORK_DIR/portable-data/data/opencode/.keep"
+printf 'portable runtime directory\n' > "$WORK_DIR/portable-data/home/.keep"
 
-echo "[ok] staged official Windows CLI for $VERSION"
+echo "[ok] staged strict Windows portable for $VERSION"
 echo "[size] staging tree:"
 du -sh "$WORK_DIR"
 du -sh "$WORK_DIR"/* 2>/dev/null | sort -h
