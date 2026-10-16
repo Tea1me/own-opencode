@@ -91,7 +91,7 @@ jobs:
   validate-windows-modern:
     needs: [get-version, build]
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: 下载 Windows modern 产物
         uses: actions/download-artifact@v4
@@ -215,11 +215,72 @@ jobs:
             throw "OpenCode leaked a config directory into host home: $hostConfig"
           }
 
+      - name: 匿名默认免费模型真实推理
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path 'unpacked/windows-modern').Path
+          $bat = Join-Path $root 'opencode.bat'
+          $portable = Join-Path $root 'portable-data'
+          $configFile = Join-Path $portable 'config\opencode\opencode.jsonc'
+          $project = Join-Path $PWD 'inference-project'
+          New-Item -ItemType Directory -Force -Path $project | Out-Null
+
+          @'
+          {
+            "$schema": "https://opencode.ai/config.json"
+          }
+          '@ | Set-Content -Encoding UTF8 $configFile
+
+          Push-Location $project
+          try {
+            cmd /d /c "`"$bat`" models opencode > free-models.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content free-models.txt
+              throw "listing anonymous opencode models failed: $LASTEXITCODE"
+            }
+            $models = Get-Content free-models.txt | Where-Object { $_ -match '^opencode/' }
+            $models | ForEach-Object { Write-Host "free model: $_" }
+            if (-not $models -or $models.Count -lt 1) { throw 'no anonymous OpenCode model is available' }
+
+            @"
+          @echo off
+          call "$bat" run "Compute 41837 + 57264. Reply with only the integer result." --format json
+          "@ | Set-Content -Encoding ASCII e2e.cmd
+
+            $stdout = Join-Path $project 'inference-stdout.txt'
+            $stderr = Join-Path $project 'inference-stderr.txt'
+            $proc = Start-Process -FilePath 'cmd.exe' `
+              -ArgumentList @('/d', '/c', 'e2e.cmd') `
+              -WorkingDirectory $project `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr `
+              -PassThru
+
+            if (-not $proc.WaitForExit(180000)) {
+              try { $proc.Kill($true) } catch {}
+              throw 'default-model inference timed out after 180 seconds'
+            }
+            $proc.WaitForExit()
+
+            $out = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { '' }
+            $err = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
+            Write-Host $out
+            Write-Host $err
+            if ($proc.ExitCode -ne 0) { throw "default-model inference failed: $($proc.ExitCode)" }
+            if ($out -notmatch '99101') { throw 'default free model did not return expected result 99101' }
+
+            $db = Join-Path $portable 'data\opencode\opencode.db'
+            if (-not (Test-Path $db)) { throw "portable DB missing after inference: $db" }
+          }
+          finally {
+            Pop-Location
+          }
+
       - name: 安装 ConPTY 测试辅助工具
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: 从包外项目目录执行 Windows 交互 TUI smoke
+      - name: TUI 中真实发送消息并等待免费模型回复
         shell: pwsh
         env:
           PYTHONIOENCODING: utf-8
@@ -232,26 +293,57 @@ jobs:
           from winpty import PtyProcess
 
           root = os.path.abspath(r"unpacked\windows-modern")
-          project = os.path.abspath(r"project-smoke")
+          project = os.path.abspath(r"inference-project")
           bat = os.path.join(root, "opencode.bat")
+          prompt = "Compute 41837 + 57264. Reply with only the integer result."
+          expected = "99101"
+
           proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=project, dimensions=(120, 40))
           chunks = []
+          lock = threading.Lock()
 
           def reader():
               try:
                   while proc.isalive():
                       data = proc.read(4096)
                       if data:
-                          chunks.append(data)
+                          with lock:
+                              chunks.append(data)
               except (EOFError, OSError):
                   pass
 
           thread = threading.Thread(target=reader, daemon=True)
           thread.start()
-          time.sleep(12)
-          alive = proc.isalive()
+          time.sleep(6)
+          if not proc.isalive():
+              raise SystemExit("TUI exited before accepting a message")
 
-          if alive:
+          proc.write(prompt)
+          proc.write("\r")
+
+          deadline = time.time() + 90
+          found = False
+          while time.time() < deadline:
+              with lock:
+                  output = "".join(chunks)
+              if expected in output:
+                  found = True
+                  break
+              if not proc.isalive():
+                  break
+              time.sleep(0.5)
+
+          with lock:
+              output = "".join(chunks)
+
+          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+          clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
+          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
+          print(clean[-20000:])
+          print(f"expected_found={found} alive={proc.isalive()} raw_chars={len(output)}")
+
+          if proc.isalive():
               try:
                   proc.write("\x03")
               except Exception:
@@ -261,25 +353,14 @@ jobs:
               proc.terminate(force=True)
           thread.join(timeout=2)
 
-          output = "".join(chunks)
-          clean = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
-          clean = re.sub(r"\x1bP.*?\x1b\\", "", clean, flags=re.S)
-          clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
-          clean = "".join(ch for ch in clean if ch in "\r\n\t" or ord(ch) >= 32)
-          printable = clean.strip()
-
-          print(repr(output[:16000]))
-          print(printable[:12000])
-          print(f"printable chars={len(printable)} alive_after_12s={alive}")
-
           lower = output.lower()
           for marker in ("module not found", "cannot find module", "unexpected error", "syntaxerror", "referenceerror"):
               if marker in lower:
                   raise SystemExit(f"TUI emitted fatal marker: {marker}")
-          if len(printable) < 80:
-              raise SystemExit("interactive TUI did not render enough printable terminal content")
-          '@ | Set-Content -Encoding UTF8 tui_smoke.py
-          python tui_smoke.py
+          if not found:
+              raise SystemExit("TUI message was submitted but no reply containing 99101 arrived within 90 seconds")
+          '@ | Set-Content -Encoding UTF8 tui_inference_smoke.py
+          python tui_inference_smoke.py
 
   release:
     needs: [get-version, build, validate-windows-modern]
@@ -313,7 +394,8 @@ jobs:
             - Windows HOME/USERPROFILE、配置、数据库、缓存、状态、临时目录全部位于 portable-data
             - 全局 opencode.jsonc 位于 portable-data/config/opencode/opencode.jsonc
             - 从任意项目目录运行 opencode 时保留原工作目录，不会切到程序目录
-            - Windows 包发布前会从包外项目目录执行路径、配置读取及 ConPTY TUI 真启动验证
+            - Windows 发布前会匿名发现 OpenCode 免费模型，不指定 --model 执行真实推理，并在 ConPTY TUI 内自动输入消息、按 Enter、等待实际模型回复
+            - 任一真实消息往返失败都会阻止 Release
             - OpenCode 自更新已关闭，版本更新由本仓库 Release 流程统一管理
           files: dist/*.tar.gz
           overwrite_files: true
