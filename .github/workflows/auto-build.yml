@@ -107,12 +107,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path unpacked | Out-Null
           tar -xzf $archive.FullName -C unpacked
 
-      - name: 验证编译引擎与 portable 启动器
+      - name: 验证编译引擎与严格 portable 启动器
         shell: pwsh
         run: |
           $root = Resolve-Path 'unpacked/windows-modern'
           $exe = Join-Path $root 'bin/opencode.exe'
+          $configFile = Join-Path $root 'portable-data/config/opencode/opencode.jsonc'
           if (-not (Test-Path $exe)) { throw 'bin/opencode.exe missing' }
+          if (-not (Test-Path $configFile)) { throw 'package-local opencode.jsonc missing' }
 
           $expected = '${{ needs.get-version.outputs.tag }}'.TrimStart('v')
           $actual = (& $exe --version).Trim()
@@ -120,37 +122,59 @@ jobs:
           if ($actual -ne $expected) { throw "expected $expected, got $actual" }
 
           $bat = Get-Content (Join-Path $root 'opencode.bat') -Raw
+          if ($bat -match '(?im)^\s*cd\s+/d\s+') { throw 'launcher must not change caller working directory' }
           foreach ($needle in @(
-            'OPENCODE_CONFIG_DIR=',
-            'OPENCODE_DB=%PORTABLE%\data\opencode.db',
-            'XDG_CONFIG_HOME=',
-            'XDG_DATA_HOME=',
-            'XDG_CACHE_HOME=',
-            'XDG_STATE_HOME=',
-            'TEMP=%PORTABLE%',
-            'TMP=%PORTABLE%',
+            'HOME=%PORTABLE_HOME%',
+            'USERPROFILE=%PORTABLE_HOME%',
+            'APPDATA=%PORTABLE_HOME%\AppData\Roaming',
+            'LOCALAPPDATA=%PORTABLE_HOME%\AppData\Local',
+            'XDG_CONFIG_HOME=%CONFIG_HOME%',
+            'XDG_DATA_HOME=%DATA_HOME%',
+            'XDG_CACHE_HOME=%CACHE_HOME%',
+            'XDG_STATE_HOME=%STATE_HOME%',
+            'XDG_RUNTIME_DIR=%TMP_HOME%',
+            'OPENCODE_CONFIG_DIR=%CONFIG_DIR%',
+            'OPENCODE_DB=%DATA_HOME%\opencode\opencode.db',
+            'TEMP=%TMP_HOME%',
+            'TMP=%TMP_HOME%',
             'OPENCODE_DISABLE_AUTOUPDATE=1',
             'bin\opencode.exe'
           )) {
             if ($bat -notmatch [regex]::Escape($needle)) { throw "launcher missing: $needle" }
           }
 
-      - name: 验证 CLI 与 portable 路径
+      - name: 从包外项目目录验证配置与全部 portable 路径
         shell: pwsh
         run: |
-          $root = Resolve-Path 'unpacked/windows-modern'
-          Push-Location $root
+          $root = (Resolve-Path 'unpacked/windows-modern').Path
+          $bat = Join-Path $root 'opencode.bat'
+          $portable = Join-Path $root 'portable-data'
+          $configFile = Join-Path $portable 'config\opencode\opencode.jsonc'
+          $project = Join-Path $PWD 'project-smoke'
+          New-Item -ItemType Directory -Force -Path $project | Out-Null
+
+          @'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "model": "portable/sentinel-model"
+          }
+          '@ | Set-Content -Encoding UTF8 $configFile
+
+          $hostConfig = Join-Path $env:USERPROFILE '.config\opencode'
+          $hostConfigExisted = Test-Path $hostConfig
+
+          Push-Location $project
           try {
-            cmd /d /c "opencode.bat --version"
+            cmd /d /c "`"$bat`" --version"
             if ($LASTEXITCODE -ne 0) { throw "opencode --version failed: $LASTEXITCODE" }
 
-            cmd /d /c "opencode.bat --help > smoke-help.txt 2>&1"
+            cmd /d /c "`"$bat`" --help > smoke-help.txt 2>&1"
             if ($LASTEXITCODE -ne 0) {
               Get-Content smoke-help.txt
               throw "opencode --help failed: $LASTEXITCODE"
             }
 
-            cmd /d /c "opencode.bat debug paths > smoke-paths.txt 2>&1"
+            cmd /d /c "`"$bat`" debug paths > smoke-paths.txt 2>&1"
             if ($LASTEXITCODE -ne 0) {
               Get-Content smoke-paths.txt
               throw "opencode debug paths failed: $LASTEXITCODE"
@@ -158,23 +182,44 @@ jobs:
             $paths = Get-Content smoke-paths.txt -Raw
             Write-Host $paths
 
-            $portable = (Resolve-Path 'portable-data').Path
-            foreach ($part in @('config', 'data', 'cache', 'state', 'tmp')) {
-              $expectedPath = Join-Path $portable $part
-              if ($paths -notlike "*$expectedPath*") {
-                throw "debug paths did not report portable $part path: $expectedPath"
+            $expected = @{
+              home   = (Join-Path $portable 'home')
+              config = (Join-Path $portable 'config\opencode')
+              data   = (Join-Path $portable 'data\opencode')
+              cache  = (Join-Path $portable 'cache\opencode')
+              state  = (Join-Path $portable 'state\opencode')
+              tmp    = (Join-Path $portable 'tmp\opencode')
+            }
+            foreach ($entry in $expected.GetEnumerator()) {
+              if ($paths -notlike "*$($entry.Value)*") {
+                throw "debug paths did not report portable $($entry.Key) path: $($entry.Value)"
               }
+            }
+
+            cmd /d /c "`"$bat`" debug config > smoke-config.txt 2>&1"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content smoke-config.txt
+              throw "opencode debug config failed: $LASTEXITCODE"
+            }
+            $resolved = Get-Content smoke-config.txt -Raw
+            if ($resolved -notlike '*portable/sentinel-model*') {
+              Write-Host $resolved
+              throw 'package-local opencode.jsonc was not loaded'
             }
           }
           finally {
             Pop-Location
           }
 
+          if (-not $hostConfigExisted -and (Test-Path $hostConfig)) {
+            throw "OpenCode leaked a config directory into host home: $hostConfig"
+          }
+
       - name: 安装 ConPTY 测试辅助工具
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --quiet pywinpty
 
-      - name: Windows 真机交互 TUI smoke
+      - name: 从包外项目目录执行 Windows 交互 TUI smoke
         shell: pwsh
         env:
           PYTHONIOENCODING: utf-8
@@ -187,8 +232,9 @@ jobs:
           from winpty import PtyProcess
 
           root = os.path.abspath(r"unpacked\windows-modern")
+          project = os.path.abspath(r"project-smoke")
           bat = os.path.join(root, "opencode.bat")
-          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=root, dimensions=(120, 40))
+          proc = PtyProcess.spawn(["cmd.exe", "/d", "/c", bat], cwd=project, dimensions=(120, 40))
           chunks = []
 
           def reader():
@@ -263,9 +309,11 @@ jobs:
           body: |
             🚀 便携版
             - Linux x64/arm64 (glibc/musl)
-            - Windows x64 modern (Windows 10+，官方编译 CLI + portable 启动器)
-            - Windows 配置、数据、缓存、状态与临时文件重定向到 portable-data
-            - Windows 包发布前会在 windows-latest 的 ConPTY 中执行无参数 TUI 真启动验证
+            - Windows x64 modern (Windows 10+，官方编译 CLI + 严格 portable 启动器)
+            - Windows HOME/USERPROFILE、配置、数据库、缓存、状态、临时目录全部位于 portable-data
+            - 全局 opencode.jsonc 位于 portable-data/config/opencode/opencode.jsonc
+            - 从任意项目目录运行 opencode 时保留原工作目录，不会切到程序目录
+            - Windows 包发布前会从包外项目目录执行路径、配置读取及 ConPTY TUI 真启动验证
             - OpenCode 自更新已关闭，版本更新由本仓库 Release 流程统一管理
           files: dist/*.tar.gz
           overwrite_files: true
